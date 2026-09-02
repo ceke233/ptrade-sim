@@ -1,0 +1,21 @@
+{
+  "data_dir": "G:/data",
+  "start_date": "2025-01-01",
+  "end_date": "2025-06-30",
+  "capital_base": 100000,
+  "benchmark": "000300.SS",
+  "strategy": "examples/yijin2_5x892.py",
+  "preload": {
+    "mode": "rolling",
+    "rolling_window_days": 2,
+    "threads": 16
+  },
+  "cost": {
+    "commission_ratio": 0.0003,
+    "min_commission": 5.0,
+    "handling_fee_ratio": 4.87e-05,
+    "stamp_tax": 0.001,
+    "slippage_ratio": 0.0,
+    "_comment": "PTrade 默认无滑点（策略未调用 set_slippage 时）；如需模拟滑点成本改此值"
+  }
+}

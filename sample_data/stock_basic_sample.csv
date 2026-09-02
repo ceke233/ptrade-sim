@@ -1,0 +1,4 @@
+code,symbol,name,area,industry,fullname,enname,cnspell,market,exchange,curr_type,list_status,list_date,delist_date,is_hs,act_name,act_ent_type
+000001.SZ,000001,平安银行,深圳,银行,平安银行股份有限公司,"Ping An Bank Co., Ltd.",PAYH,主板,SZSE,CNY,L,19910403,,S,无实际控制人,其他
+000002.SZ,000002,万科Ａ,深圳,全国地产,万科企业股份有限公司,"China Vanke Co.,Ltd.",WKA,主板,SZSE,CNY,L,19910129,,S,无实际控制人,其他
+600000.SH,600000,浦发银行,上海,银行,上海浦东发展银行股份有限公司,"Shanghai Pudong Development Bank Co.,Ltd.",PFYH,主板,SSE,CNY,L,19991110,,H,无实际控制人,其他

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# 回测输出
+backtest_results/
+
+# 本地数据（可选增强数据，不入库）
+data/
+*.parquet
+
+# 工具/编辑器
+.idea/
+.vscode/
+*.log
+.DS_Store
