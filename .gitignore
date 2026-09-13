@@ -11,9 +11,37 @@ venv/
 # 回测输出
 backtest_results/
 
-# 本地数据（可选增强数据，不入库）
-data/
+# 本地数据（不入库）
+#   data/ 是约定俗成的本地数据目录：DuckDB 库文件、源行情、可选增强数据。
+#   目录本身要保留（放 .gitkeep），所以用 data/* 而非 data/，再放行说明文件。
+data/*
+!data/.gitkeep
+!data/README.md
 *.parquet
+
+# DuckDB 库文件：动辄几十 GB，**任何位置**都不得入库
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.duckdb.tmp/
+
+# 前端（看板）
+web/node_modules/
+web/dist/
+web/.tmp/
+web/*.local
+
+# 本地私有（不入库）：这些文件用于放真实路径与库连接，
+# 模板见同名 .example 文件（config.example.json / strategy_names.example.json）
+ptrade_config.json
+.local_config.json
+
+# 测试与覆盖率产物
+.pytest_cache/
+.coverage
+coverage.xml
+coverage.json
+htmlcov/
 
 # 工具/编辑器
 .idea/

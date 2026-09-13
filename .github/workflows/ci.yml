@@ -1,0 +1,258 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消上一次未完成的运行，节省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONIOENCODING: utf-8
+  # 前端工具链版本：pnpm 版本必须与 web/pnpm-lock.yaml 的生成版本一致，
+  # 否则 `--frozen-lockfile` 可能判定 lockfile 过期。
+  PNPM_VERSION: "11.8.0"
+  NODE_VERSION: "24"
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff>=0.6"
+      - name: ruff check
+        run: ruff check src tests
+      - name: ruff format --check
+        run: ruff format --check src tests
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          pip install -e ".[dev,duckdb,dashboard]"
+      - name: mypy
+        run: mypy
+
+  # 前端（web/）：eslint 静态检查 + `vue-tsc -b && vite build`（类型检查 + 构建）。
+  # 与 Python 的 lint/typecheck/test 并列，都是 build 的前置条件。
+  frontend:
+    name: Frontend (lint, typecheck, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint (eslint)
+        run: pnpm run lint
+      # build 脚本本身就是 `vue-tsc -b && vite build`：
+      # vue-tsc 负责 TS / Vue 模板的类型检查，vite 产出 dist。
+      - name: Build (vue-tsc -b && vite build)
+        run: pnpm run build
+      - name: Upload web/dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 运行下限 3.10 与较新版本都覆盖
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,duckdb,dashboard,perf]"
+      - name: Run tests with coverage
+        run: pytest --cov --cov-report=xml --cov-report=term --cov-report=json:coverage.json
+      - name: Per-module coverage floors
+        # 全局门槛由 pytest 的 fail_under 把关；这里**按模块**设下限，防止
+        # 「整体达标、局部裸奔」—— cache 92% 的余量足以盖住 dbtools 58%。
+        # 下限表与 ratchet 语义见 scripts/check_coverage.py。
+        run: python scripts/check_coverage.py
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: |
+            coverage.xml
+            coverage.json
+          if-no-files-found: ignore
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, frontend, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # ---- 1) 先构建前端 ----
+      # 这里重新构建而不是复用 frontend 的 artifact，是为了让 build job 自成一体
+      # （对 workflow_dispatch / 将来的 release 流程更稳）。pnpm store 有缓存。
+      - name: Build frontend
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      # ---- 2) 把 web/dist 放进包目录 ----
+      # server.py `_web_dist_candidates()` 第 2 条候选就是「包目录 <包>/web/dist」，
+      # wheel 的 packages=["src/ptrade_sim"] 会把它一并打包。
+      - name: Bundle frontend into the package
+        run: |
+          mkdir -p src/ptrade_sim/web
+          rm -rf src/ptrade_sim/web/dist
+          cp -R web/dist src/ptrade_sim/web/dist
+          test -f src/ptrade_sim/web/dist/index.html
+          find src/ptrade_sim/web/dist -type f | sort
+
+      # ---- 3) 打包 ----
+      # ⚠️ 必须分两次调用：`python -m build`（默认 sdist+wheel）会先构建 sdist、
+      # 再**从 sdist** 构建 wheel，而 sdist 不含构建好的前端
+      # （它的定位是「源码 + 前端源码，用户自行 pnpm build」），
+      # 于是产出的 wheel 又会丢掉看板。`--wheel` 才是从当前源码树构建。
+      - name: Build
+        run: |
+          pip install build
+          python -m build --wheel
+          python -m build --sdist
+
+      # ---- 4) 断言 wheel 真的带上了前端 ----
+      # 没有这一步，前端缺失会「静默通过」——正是这次要修的缺口。
+      - name: Verify wheel bundles the dashboard
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          prefix = "ptrade_sim/web/dist/"
+          frontend = sorted(n for n in names if n.startswith(prefix))
+          print(f"{whl}: {len(names)} entries, {len(frontend)} frontend entries")
+          for name in frontend:
+              print(f"  {name}")
+
+          if f"{prefix}index.html" not in names:
+              sys.exit("ERROR: wheel 里没有 ptrade_sim/web/dist/index.html，看板不会随包分发")
+          if not any(n.startswith(f"{prefix}assets/") for n in frontend):
+              sys.exit("ERROR: wheel 里没有 dist/assets/*，前端静态资源缺失")
+          print("OK: wheel bundles the dashboard")
+          PY
+
+      # ---- 5) 安装并确认看板真的能被服务出来 ----
+      # 装 [dashboard] extra（fastapi + uvicorn），下面那步要用 uvicorn 起服务。
+      - name: Verify wheel imports
+        run: |
+          whl="$(ls dist/*.whl)"
+          pip install "${whl}[dashboard]"
+          python -c "import ptrade_sim, ptrade_sim.cli, ptrade_sim.runtime; print('import ok')"
+          ptrade-sim --help
+
+      # ---- 6) 确认「装完 wheel 就能打开看板」 ----
+      # 从 runner.temp（仓库之外）启动服务：这样 resolve_web_dist() 命中的只能是
+      # 候选 2「包目录 <包>/web/dist」，而不会命中候选 3「仓库根 web/dist」。
+      # 只用 uvicorn + curl（前者在 [dashboard] extra 里、后者 runner 自带），
+      # **不用 TestClient**：新版 starlette 的 TestClient 需要 httpx2，
+      # 装 httpx 会直接 RuntimeError，会让这条 CI 变红。
+      - name: Verify bundled dashboard is served
+        working-directory: ${{ runner.temp }}
+        run: |
+          root="$(mktemp -d)"
+          ptrade-sim dashboard --root "$root" --port 8791 > dashboard.log 2>&1 &
+          pid=$!
+          trap 'kill "${pid:-}" 2>/dev/null || true' EXIT
+
+          up=0
+          for _ in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:8791/api/ping > ping.json; then
+              up=1
+              break
+            fi
+            sleep 0.5
+          done
+
+          cat dashboard.log
+
+          if [ "$up" != "1" ]; then
+            echo "::error::看板未在 20s 内就绪"
+            exit 1
+          fi
+          echo "ping: $(cat ping.json)"
+
+          if ! curl -sf http://127.0.0.1:8791/ -o page.html; then
+            echo "::error::GET / 失败 —— 前端很可能没随 wheel 分发（页面返回 503）"
+            exit 1
+          fi
+          if ! grep -q '<div id="app">' page.html; then
+            echo "::error::首页不是前端产物"
+            cat page.html
+            exit 1
+          fi
+
+          asset="$(grep -o '/assets/[^"]*' page.html | head -n 1)"
+          if [ -z "$asset" ]; then
+            echo "::error::首页里没有 /assets/ 静态资源引用"
+            exit 1
+          fi
+          curl -sf "http://127.0.0.1:8791${asset}" -o asset.out
+          test -s asset.out
+          echo "OK: dashboard served from the installed wheel (${asset}, $(wc -c < asset.out) bytes)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

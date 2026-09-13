@@ -1,0 +1,51 @@
+# pre-commit 钩子：提交前自动做格式化与静态检查。
+#
+#   pip install pre-commit && pre-commit install
+#   pre-commit run --all-files        # 手动全量跑一次
+#
+# 与 CI 保持一致：ruff 用同一份 pyproject 配置，mypy 同样只在 src 上跑。
+
+default_language_version:
+  python: python3.12
+
+repos:
+  # ---- 通用卫生 ----
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+        # 用户本地私有配置允许带注释式键，不需要严格校验
+        exclude: ^config\.example\.json$
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: debug-statements
+      - id: detect-private-key
+
+  # ---- Python：格式化 + lint（配置取自 pyproject.toml）----
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^(src|tests)/
+      - id: ruff-format
+        files: ^(src|tests)/
+
+  # ---- 类型检查（本地钩子，用项目自己的 mypy 配置）----
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (src)
+        entry: mypy
+        language: system
+        pass_filenames: false
+        files: ^src/ptrade_sim/.*\.py$
+        require_serial: true
