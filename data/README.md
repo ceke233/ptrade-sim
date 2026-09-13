@@ -48,3 +48,10 @@ ptrade-sim db verify --db data/quant.duckdb --data-dir G:/data
 - 构建 2019–2025 实测约 **48 GB**、约 **20 分钟**（8 线程）
 - 回测本身是**流式**读库（`preload.mode=rolling`），不需要把这 48 GB 载入内存；
   实测分钟数据常驻约 35 MB/天，按可用内存的 25% 滚动
+- **但要注意 DuckDB 自己的缓冲池**：它的 `memory_limit` 默认是系统内存的 80%，
+  且缓冲池（`duckdb_memory()` 里的 `BASE_TABLE`）**只增不减** —— 读过的表页会
+  一直被缓存。在「每天读不同日期、几乎没有页复用」的回测负载下这纯属浪费，
+  实测按约 **18 MB/天**累积（6 年区间仅它自己就 26 GB+）。
+
+  所以 `cache.duckdb_memory_limit` 默认设为 `"2GB"`，**不要改成 `null`**。
+  详见 [README 的「缓存与内存」](../README.md#缓存与内存)。

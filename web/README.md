@@ -50,6 +50,12 @@ cp -R dist ../src/ptrade_sim/web/dist
 cd .. && python -m build --wheel
 ```
 
+> ⚠️ **开发时的坑**：第 2 条（包目录）**优先于**第 3 条（仓库根 `web/dist`）。
+> 所以一旦 `src/ptrade_sim/web/dist` 存在（例如你为了试打包复制过一次），
+> 之后 `pnpm build` 的新产物**不会被 serve** —— 页面看起来"改了没生效"。
+> 三种解法：删掉包内那份、用 `PTRADE_SIM_WEB_DIST` 显式指向 `web/dist`、
+> 或改前端时直接用 `pnpm dev`（走 vite 的 HMR，不经过这个查找）。
+
 ⚠️ 打包必须用 `python -m build --wheel`。`python -m build`（默认 sdist+wheel）
 会**先构建 sdist、再从 sdist 构建 wheel**，而 sdist 不含构建好的前端
 （它的定位是「源码 + 前端源码，用户自行 `pnpm build`」），
