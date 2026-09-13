@@ -197,8 +197,44 @@ ptrade-sim backtest --strategy strategies/my_momentum \
 ptrade-sim dashboard --port 8765 --root backtest_results
 ```
 
-前端功能：run 列表、指标卡、资金曲线与回撤、月度收益矩阵、持仓与成交明细、
-日志尾（可向前翻页）、策略源码查看。
+看板是**只读**的：它不参与回测，只从 `--root` 目录读取 run 产物
+（`summary.json` / `daily_stats.csv` / `trades.csv` / `output.log` / `progress.json`）。
+所以它在独立进程里跑，与回测互不影响 —— 关掉看板不会中断任何回测，
+回测进程退出看板也照常存活。
+
+#### 列表页
+
+每 3 秒自动刷新，按 run 倒序展示：状态、策略名、回测区间与耗时、
+核心指标（总收益 / 年化 / 夏普 / 最大回撤）、进度、以及「源码」入口。
+顶部汇总总 run 数、完成 / 运行中 / 中断的个数。
+
+![看板列表页](docs/dashboard-runs.png)
+
+> 运行中的 run 会显示实时进度（`progress.json` 逐日落盘），
+> 所以长区间回测可以边跑边看。
+
+#### 详情页 · 收益概览
+
+指标卡覆盖：总收益率、基准收益、年化、夏普、Alpha / Beta、最大回撤、
+卡尔玛、胜率、盈亏比、期末资产、成交笔数、累计佣金。
+
+图表为**资金曲线**（策略 vs 基准，累计收益率）、**回撤曲线**、
+**月度收益分布**。
+
+![收益概览](docs/dashboard-overview.png)
+
+#### 详情页 · 交易明细
+
+逐笔成交，服务端分页。列：时间 / 代码 / 方向 / 成交价 / 数量 / 成交额 /
+手续费 / 平仓盈亏。
+
+![交易明细](docs/dashboard-trades.png)
+
+#### 详情页 · 输出日志
+
+日志尾部，可向前翻页加载更早内容（默认先加载 500 行，按需继续取）。
+
+![输出日志](docs/dashboard-log.png)
 
 ### 6. 产出
 
@@ -530,7 +566,9 @@ ptrade-sim/
 ├── data/                本地数据目录（库文件/源行情；**内容不入库**，见 data/README.md）
 ├── web/                 看板前端（Vite + Vue 3 + TS；产物 dist/ 不入库）
 ├── examples/            示例策略（目录形态：strategy.py + strategy_config.json）
-├── docs/                PTrade API 参考（ptrade_api.md）
+├── docs/                PTrade API 参考 + 看板界面截图
+│   ├── ptrade_api.md
+│   └── dashboard-*.png
 └── .github/workflows/   CI：lint / typecheck / frontend / test / build
 ```
 
