@@ -1,27 +1,33 @@
-# -*- coding: utf-8 -*-
 """PTrade 策略模拟回测平台运行时。
 
 实现 PTrade API 适配层、本地账户（T+1）、任务调度与分钟级撮合核心。
 
-数据环境：G:/data（hive 按天分区 parquet，1 文件 = 1 天全市场）
-- 分钟 bar 语义（已经数据探针验证）：每交易日 241 根，全部按结束时间标注——
-  09:30（集合竞价+首分钟，独立保留用于开盘买入与竞价判断）、
-  09:31~11:30（120 根）、13:01~15:00（120 根）。
+数据环境：DuckDB 物理库（默认 ``data/quant.duckdb``），由 hive 按天分区的 parquet 源构建。
+引擎**只连 DuckDB**取数，不再直接读 parquet。
+
+分钟 bar 语义（已经数据探针验证）：每交易日 **241 根**，全部按结束时间标注——
+09:30（集合竞价+首分钟）、09:31~11:30（120 根）、13:01~15:00（120 根）。
+
+**为什么是 241 根而不是 240 根**：09:30 这一根对应**集合竞价的成交时点**——
+实盘中集合竞价挂单就是在 9:30 撮合成交，开盘价即该次竞价的成交价。
+因此 `handle_data` 必须在 09:30 触发一次，策略才能在该时点判断/买入；
+若只跑到 09:31 起，等于丢掉了开盘这一最重要的一次决策点。
+这不是对官方的偏差，而是对实盘竞价撮合的正确建模。
 """
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import math
 import uuid
-import importlib.util
 from bisect import bisect_left, bisect_right
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, date
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -29,52 +35,29 @@ import polars as pl
 from loguru import logger
 from tqdm import tqdm
 
+from ptrade_sim.api import build_api
+from ptrade_sim.cache import MISSING, CacheConfig, CacheGroup
+from ptrade_sim.config import DEFAULT_CAPITAL_BASE
+from ptrade_sim.conventions import (
+    DAY_SLOTS,
+    day_dt_date,
+    day_iso,
+    limit_pct,
+    limit_price,
+    norm_day,
+    norm_index_code,
+    to_ptrade_code,
+)
+from ptrade_sim.data_source import make_source
+from ptrade_sim.exceptions import DataError, StrategyError, StrategyImportError
+from ptrade_sim.history import Clock, HistoryProvider
 
-# ============================================================
-# matplotlib 中文字体（跨平台）：系统字体优先，缺失时回退
-# Windows 字体目录（WSL 直挂 /mnt/c/Windows/Fonts 场景）
-# ============================================================
-def setup_matplotlib_cn_font() -> None:
-    """注册中文字体到 matplotlib，使图表中文正常渲染。
 
-    规则：
-    1. 已安装的常用中文字体（含 Windows 字体目录可访问的场景）直接可用；
-    2. 否则动态 addfont 注册候选字体文件；
-    3. 全部失败时保持默认（仅提示，不抛异常）。
-    """
-    import matplotlib.font_manager as fm
-    from matplotlib import rcParams
-
-    candidates = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei"]
-    # 已注册/可用的字体名集合（初始化一次，避免反复扫描）
-    available = {f.name for f in fm.fontManager.ttflist}
-    hit = next((c for c in candidates if c in available), None)
-    if hit is not None:
-        rcParams["font.sans-serif"] = [hit]
-        rcParams["axes.unicode_minus"] = False
-        return
-
-    # 系统字体未命中：尝试从常见路径注册字体文件（WSL 访问 Windows 字体）
-    font_files = [
-        "/mnt/c/Windows/Fonts/msyh.ttc",   # 微软雅黑
-        "/mnt/c/Windows/Fonts/simhei.ttf",  # 黑体
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    ]
-    for path in font_files:
-        try:
-            if Path(path).exists():
-                fm.fontManager.addfont(path)
-                available = {f.name for f in fm.fontManager.ttflist}
-                hit = next((c for c in candidates if c in available), None)
-                if hit is not None:
-                    rcParams["font.sans-serif"] = [hit]
-                    rcParams["axes.unicode_minus"] = False
-                    logger.info(f"中文字体已注册：{path} -> {hit}")
-                    return
-        except Exception as exc:  # 单个字体失败不影响其他候选
-            logger.warning(f"字体注册失败 {path}：{exc}")
-    logger.warning("未找到可用中文字体，报告图表中文可能显示为方块")
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本文件：先写临时文件再替换，避免读者读到半截内容。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 # ============================================================
@@ -82,45 +65,9 @@ def setup_matplotlib_cn_font() -> None:
 # ============================================================
 
 
-def to_data_code(code: str) -> str:
-    """PTrade/聚宽代码 -> 数据源代码（.SS/.XSHG -> .SH，.XSHE -> .SZ）"""
-    if isinstance(code, str):
-        return (
-            code.replace(".SS", ".SH").replace(".XSHG", ".SH").replace(".XSHE", ".SZ")
-        )
-    return code
-
-
-def to_ptrade_code(code: str) -> str:
-    """数据源代码 -> PTrade 代码（.SH -> .SS；兼容聚宽 .XSHG/.XSHE）"""
-    if isinstance(code, str):
-        return (
-            code.replace(".XSHG", ".SS").replace(".XSHE", ".SZ").replace(".SH", ".SS")
-        )
-    return code
-
-
-def _limit_pct(is_st: int, code: str = "", ds: str = "") -> float:
-    """涨跌停比例（按板块与日期，交易所规则）：
-    - 科创板（688/689）：±20%（无 ST 限制）
-    - 创业板（300/301）：2020-08-24 注册制改革后 ±20%，此前 ±10%
-    - 北交所（8/4 开头）：±30%
-    - 主板（其余）：ST ±5%，非 ST ±10%
-    """
-    if code.startswith(("688", "689")):
-        return 0.20
-    if code.startswith(("300", "301")):
-        return 0.20 if (not ds or ds >= "20200824") else 0.10
-    if code.startswith(("8", "4")):
-        return 0.30
-    return 0.05 if int(is_st) else 0.10
-
-
-def _limit_price(pre_close: float, pct: float) -> float:
-    """交易所涨/跌停价：Decimal 精确四舍五入（ROUND_HALF_UP），先归一化到分再乘比例。
-    Python round() 因浮点表示会把 9.185 舍成 9.18，交易所应为 9.19（601022 案例根因）。"""
-    pc = Decimal(str(round(float(pre_close), 2)))
-    return float((pc * Decimal(str(1 + pct))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+# ============================================================
+# 日期格式：YYYYMMDD <-> YYYY-MM-DD
+# ============================================================
 
 
 # ============================================================
@@ -128,25 +75,7 @@ def _limit_price(pre_close: float, pct: float) -> float:
 # ============================================================
 
 
-def _build_day_slots() -> tuple[str, ...]:
-    slots = ["09:30"]  # 集合竞价+首分钟 bar（独立保留）
-    t = 9 * 60 + 31
-    while t <= 11 * 60 + 30:
-        slots.append(f"{t // 60:02d}:{t % 60:02d}")
-        t += 1
-    t = 13 * 60 + 1
-    while t <= 15 * 60:
-        slots.append(f"{t // 60:02d}:{t % 60:02d}")
-        t += 1
-    return tuple(slots)
-
-
-DAY_SLOTS: tuple[str, ...] = _build_day_slots()
-assert len(DAY_SLOTS) == 241, f"分钟槽位数应为 241，实际 {len(DAY_SLOTS)}"
-SLOT_INDEX: dict[str, int] = {s: i for i, s in enumerate(DAY_SLOTS)}
-_SLOT_MINUTES = np.array(
-    sorted(int(s[:2]) * 60 + int(s[3:]) for s in DAY_SLOTS), dtype=np.int32
-)
+_SLOT_MINUTES = np.array(sorted(int(s[:2]) * 60 + int(s[3:]) for s in DAY_SLOTS), dtype=np.int32)
 
 # 主板 A 股代码前缀（get_Ashares 双保险用）
 _MAINBOARD_PREFIX = ("000", "001", "002", "003")  # 深主板（含原中小板）
@@ -161,7 +90,7 @@ _MAINBOARD_PREFIX_SH = ("600", "601", "603", "605")  # 沪主板
 class DayMinuteData:
     """某交易日全市场分钟数据的内存索引。"""
 
-    __slots__ = ("slot", "open", "high", "low", "close", "vol", "amount", "starts")
+    __slots__ = ("amount", "close", "high", "low", "open", "slot", "starts", "vol")
 
     def __init__(self, slot: np.ndarray, o, h, low_v, c, v, a, starts: dict):
         self.slot = slot  # int32 [N] 槽位号（升序 within code）
@@ -191,31 +120,23 @@ class DayMinuteData:
         s, e = self._bounds(code)
         if s < 0:
             return slice(0, 0)
-        n = np.searchsorted(
-            self.slot[s:e], slot_idx, side="right" if include else "left"
-        )
+        n = np.searchsorted(self.slot[s:e], slot_idx, side="right" if include else "left")
         return slice(s, s + n)
 
-    def has_volume(self, code: str, slot_idx: int) -> bool:
-        r = self.row_of(code, slot_idx)
-        return r >= 0 and self.vol[r] > 0
 
+def _load_minute_day(df: pl.DataFrame | None) -> DayMinuteData | None:
+    """把某日分钟 DataFrame 构建为内存索引（线程安全，纯函数）。
 
-def _load_minute_day(path: Path) -> DayMinuteData | None:
-    """读取单个日分区分钟文件并构建内存索引（线程安全，纯函数）。"""
-    if not path.exists():
+    ``df`` 由数据源层提供，列名已统一为 PTrade 口径
+    （``volume``/``money``），``code`` 已统一为 ``.SS``。
+    """
+    if df is None or df.height == 0:
         return None
-    df = pl.read_parquet(
-        path,
-        columns=["code", "trade_time", "open", "high", "low", "close", "vol", "amount"],
-    )
-    # 统一为 PTrade 代码
-    df = df.with_columns(pl.col("code").str.replace(".SH", ".SS", literal=True))
     # trade_time "YYYY-MM-DD HH:MM:SS" -> 分钟数 -> 槽位号
     hh = df["trade_time"].str.slice(11, 2).cast(pl.Int32)
     mm = df["trade_time"].str.slice(14, 2).cast(pl.Int32)
     minutes = (hh * 60 + mm).to_numpy()
-    slot = np.searchsorted(_SLOT_MINUTES, minutes).astype(np.int32)
+    slot: np.ndarray = np.searchsorted(_SLOT_MINUTES, minutes).astype(np.int32)
     df = df.with_columns(pl.Series("slot", slot)).filter(
         pl.col("slot") < len(DAY_SLOTS)  # 排除北交所 15:00 后等非标准 bar
     )
@@ -225,7 +146,7 @@ def _load_minute_day(path: Path) -> DayMinuteData | None:
     uniq, first_idx = np.unique(codes, return_index=True)
     starts = {
         c: (int(s), int(e))
-        for c, s, e in zip(uniq, first_idx, list(first_idx[1:]) + [len(codes)])
+        for c, s, e in zip(uniq, first_idx, [*list(first_idx[1:]), len(codes)], strict=False)
     }
     return DayMinuteData(
         slot=df["slot"].to_numpy(),
@@ -233,8 +154,8 @@ def _load_minute_day(path: Path) -> DayMinuteData | None:
         h=df["high"].to_numpy(),
         low_v=df["low"].to_numpy(),
         c=df["close"].to_numpy(),
-        v=df["vol"].to_numpy(),
-        a=df["amount"].to_numpy(),
+        v=df["volume"].to_numpy(),
+        a=df["money"].to_numpy(),
         starts=starts,
     )
 
@@ -244,133 +165,181 @@ def _load_minute_day(path: Path) -> DayMinuteData | None:
 # ============================================================
 
 
+class IndexQuery(NamedTuple):
+    """``DataFeed.index_query`` 的返回值。
+
+    NamedTuple 使其**既可解包又可属性访问**，调用方按需取用::
+
+        codes, reason = feed.index_query("000300", "20200102")   # 解包
+        q = feed.index_query("399006", "20150105"); q.reason     # 属性
+    """
+
+    codes: list[str]
+    reason: str
+
+
 class DataFeed:
     """本地行情数据源。分钟数据按日整载（mode=all 预热 / rolling LRU）。"""
 
     def __init__(
         self,
-        data_dir: str,
+        db_path: str,
         start_day: str,
         end_day: str,
-        preload_mode: str = "all",
+        preload_mode: str = "rolling",
         rolling_window: int = 10,
         threads: int = 8,
+        cache_config: CacheConfig | None = None,
     ):
-        self.dir = Path(data_dir)
+        """数据源为 DuckDB 物理库（引擎不再读 parquet）。
+
+        L2 竞价在库内表 ``ashare_l2_auction``；更名历史**已合并进日线**
+        （``ashare_1d_stock.name``，时点正确），无独立表，也无外挂文件。
+        """
+        self.db_path = str(db_path)
+        self.dir = Path(str(db_path)).parent
         self.start_day = start_day
         self.end_day = end_day
         self.preload_mode = preload_mode
         self.rolling_window = rolling_window
         self.threads = threads
+        # 数据源：只连 DuckDB 物理库。
+        # memory_limit 必须显式设小：DuckDB 默认取系统内存的 80% 且缓冲池只增不减，
+        # 而本负载每天读不同日期、几乎没有页复用 —— 不设会让长区间回测累计数十 GB。
+        self.src = make_source(
+            self.db_path,
+            threads=threads,
+            memory_limit=(cache_config or CacheConfig()).duckdb_memory_limit,
+        )
+        logger.info(f"数据源：{self.src.describe()}")
 
         # --- 交易日历 ---
-        cal = pl.read_parquet(self.dir / "ashare_calendar" / "data.parquet")
+        cal = self.src.reference("ashare_calendar")
+        if cal is None:
+            raise DataError(
+                f"缺少交易日历表 ashare_calendar（{self.src.describe()}）；"
+                f"请先构建数据库：ptrade-sim db build --db {self.db_path}"
+            )
         self.trade_days: list[str] = sorted(cal["date"].to_list())  # YYYYMMDD
         self._day_pos = {d: i for i, d in enumerate(self.trade_days)}
-        self.range_days: list[str] = [
-            d for d in self.trade_days if start_day <= d <= end_day
-        ]
+        self.range_days: list[str] = [d for d in self.trade_days if start_day <= d <= end_day]
         if not self.range_days:
-            raise ValueError(f"区间 {start_day}~{end_day} 内无交易日")
+            # 日历是参考表（通常全量），区间无交易日多半是日期写错
+            cov = self.src.coverage("ashare_calendar")
+            raise DataError(
+                f"区间 {start_day}~{end_day} 内无交易日"
+                + (f"（日历覆盖 {cov[0]} ~ {cov[1]}）" if cov else "")
+            )
+
+        # --- 数据覆盖校验 ---
+        # 库里只灌了部分年份时，区间超出覆盖会**静默取不到行情**（每日返回 None），
+        # 最后得到一份"跑完但没交易"的空回测。这里显式拦截。
+        minute_cov = self.src.coverage("ashare_1m_stock")
+        daily_cov = self.src.coverage("ashare_1d_stock")
+        self.data_coverage = {"minute": minute_cov, "daily": daily_cov}
+        lo, hi = self.range_days[0], self.range_days[-1]
+        if daily_cov is None and minute_cov is None:
+            raise DataError(
+                f"DuckDB 库内没有行情数据（ashare_1d_stock / ashare_1m_stock 均为空）；"
+                f"请先构建：ptrade-sim db build --db {self.db_path}"
+            )
+        for name, cov in (("日线", daily_cov), ("分钟", minute_cov)):
+            if cov is None:
+                continue
+            if lo < cov[0] or hi > cov[1]:
+                logger.warning(
+                    f"回测区间 {lo}~{hi} 超出库内{name}数据覆盖 {cov[0]}~{cov[1]}，"
+                    f"超出部分将取不到行情（该段不会有成交）"
+                )
 
         # --- 股票基础信息 ---
-        sb = (
-            pl.read_parquet(
-                self.dir / "ashare_stock_basic" / "data.parquet",
-                columns=[
-                    "code",
-                    "name",
-                    "market",
-                    "list_date",
-                    "delist_date",
-                    "list_status",
-                ],
-            )
-            .with_columns(pl.col("code").str.replace(".SH", ".SS", literal=True))
-            .rename({"code": "pcode"})
+        sb = self.src.reference(
+            "ashare_stock_basic",
+            columns=[
+                "code",
+                "name",
+                "market",
+                "list_date",
+                "delist_date",
+                "list_status",
+            ],
         )
-        self.basic = sb.to_pandas().set_index("pcode")
+        if sb is None:
+            raise DataError(f"缺少股票基础表 ashare_stock_basic（{self.src.describe()}）")
+        # 全程 polars：仅在 API 边界（get_stock_name 等）按需转换
+        self.basic = sb
 
-        # --- 更名历史（优先当前工作目录 ./data/name_change_df.csv，回退包旁 data/）---
-        nc_path = next(
-            (p for p in (Path.cwd() / "data" / "name_change_df.csv", Path(__file__).resolve().parent / "data" / "name_change_df.csv") if p.exists()),
-            None,
-        )
-        if nc_path is not None:
-            nc = (
-                pl.read_csv(nc_path)
-                .select(
-                    [
-                        pl.col("name_change_symbol"),
-                        pl.col("name_change_change_date"),
-                        pl.col("name_change_stock_name"),
-                    ]
-                )
-                .with_columns(
-                    pl.col("name_change_symbol").str.replace(".SH", ".SS", literal=True)
-                )
-            )
-            self.name_changes: dict[str, list[tuple[str, str]]] = {}
-            for sym, chg, nm in zip(
-                nc["name_change_symbol"],
-                nc["name_change_change_date"],
-                nc["name_change_stock_name"],
-            ):
-                self.name_changes.setdefault(sym, []).append((str(chg), str(nm)))
+        # --- 更名历史：直接从日线 name 列派生（已合并，无独立表）---
+        # 源日线 name 本身即「时点正确」的简称 —— 实测对 2,939,341 行做全量比对，
+        # 与独立更名表推导结果一致率 100.0000%，故独立表冗余并已移除。
+        # 这里只抽出「名称发生变化」的时点，用于覆盖停牌等无日线行情的日期：
+        # 否则会回退到基本表的**当前**简称，让历史日期显示未来才生效的名字。
+        self.name_changes: dict[str, list[tuple[str, str]]] = {}
+        nt = self.src.name_timeline(self.start_day)
+        if nt is not None and nt.height:
+            for sym, d, nm in zip(nt["code"], nt["date"], nt["name"], strict=False):
+                # 统一存成 YYYY-MM-DD，便于与 stock_name 的比较日同格式比较
+                s = str(d)
+                self.name_changes.setdefault(str(sym), []).append((day_iso(s), str(nm)))
             for v in self.name_changes.values():
                 v.sort()
-        else:
-            self.name_changes = {}
+            logger.info(
+                f"更名时点已从日线派生：{len(self.name_changes):,} 只证券 / "
+                f"{nt.height:,} 个变化时点"
+            )
 
         # --- 指数日线（基准）---
-        idx = pl.read_parquet(self.dir / "ashare_1d_index" / "data.parquet")
-        idx = idx.with_columns(pl.col("code").str.replace(".SH", ".SS", literal=True))
-        self.index_daily: dict[str, pd.DataFrame] = {}
-        for key, g in idx.group_by("code"):
-            c = key[0] if isinstance(key, tuple) else key  # polars group_by 键为元组
-            self.index_daily[str(c)] = g.to_pandas().set_index("date")
+        # 只需「按 (代码, 日期) 取收盘价」这一种查询，故直接摊平成
+        # {代码: {日期: 收盘价}}，避免为每次基准查询做一次 DataFrame 定位。
+        idx = self.src.reference("ashare_1d_index")
+        if idx is None:
+            logger.warning(
+                f"缺少指数日线表 ashare_1d_index（{self.src.describe()}）→ 基准收益将为 NaN"
+            )
+            idx = pl.DataFrame({"code": [], "date": [], "close": []})
+        self.index_daily: dict[str, dict[str, float]] = {}
+        for c, d, cl in zip(idx["code"], idx["date"], idx["close"], strict=False):
+            self.index_daily.setdefault(str(c), {})[str(d)] = float(cl)
 
-        # --- 缓存 ---
-        self._minute_cache: OrderedDict[str, DayMinuteData] = OrderedDict()
-        self._daily_cache: dict[str, pd.DataFrame | None] = {}
-        self._feature_cache: dict[str, pd.DataFrame | None] = {}
-        self._ashares_cache: dict[str, list[str]] = {}
-        # 日线行字典缓存（code -> row dict，懒构建一次，避免逐行 df.loc / 重复 to_dict）
-        self._daily_rows: dict[str, dict[str, dict]] = {}
-        # 基本表字典缓存（code -> row，懒构建一次）
-        self._basic_dict: dict[str, dict] | None = None
-        # is_st 映射缓存（code -> 0/1，懒构建一次）
-        self._st_cache: dict[str, dict[str, int]] = {}
-        # --- L2 集合竞价表（可选增强：优先当前工作目录 ./data/l2_auction.parquet，回退包旁 data/） ---
-        self.l2_auction: dict[tuple[str, str], tuple[float, float]] = {}
-        l2_path = next(
-            (p for p in (Path.cwd() / "data" / "l2_auction.parquet", Path(__file__).resolve().parent / "data" / "l2_auction.parquet") if p.exists()),
-            None,
-        )
-        if l2_path is not None:
-            try:
-                l2 = pl.read_parquet(l2_path, columns=["date", "code", "hq_px", "business_amount"])
-                for row in l2.iter_rows():
-                    self.l2_auction[(str(row[0]).replace("-", ""), str(row[1]))] = (
-                        float(row[2]), float(row[3]),
-                    )
-                logger.info(f"L2 竞价表已加载：{len(self.l2_auction)} 条")
-            except Exception as exc:
-                logger.warning(f"L2 竞价表加载失败：{exc}")
+        # --- 缓存：统一由 CacheGroup 管理（容量上限 + 内存预算 + LRU）---
+        # 替代原先 9 个手写缓存。分钟数据按内存预算滚动（流式加载）；
+        # preload_mode="all" 时取消预算与条数上限（全量常驻），
+        # 此时应先由 resources.decide() 判定内存是否吃得下（否则会 OOM）。
+        self.cache = CacheGroup(cache_config or CacheConfig())
+        if preload_mode == "all":
+            self.cache.minute._capacity = None
+            self.cache.minute._budget = 0
+            logger.warning(
+                "preload_mode=all：分钟数据将全量常驻内存，长区间可能 OOM；"
+                "建议改用 rolling（流式，按内存预算滚动）"
+            )
+        self._minute_budget = self.cache.minute._budget
+        logger.info(f"缓存策略：{self.cache.describe()}")
+        # --- L2 集合竞价（可选表 ashare_l2_auction）---
+        # 已并入 DuckDB。**按日懒加载**：全表 571 万行，一次性建 dict 约需 850MB，
+        # 改为按日拉取（约 3500 行/日）并走 daily_rows 同款缓存。
+        self._has_l2 = "ashare_l2_auction" in self.src.tables()
+        if self._has_l2:
+            logger.debug("L2 集合竞价表可用")
+        else:
+            logger.debug("无 ashare_l2_auction 表 → 竞价回退 09:30 分钟 bar 近似")
 
-    # ---------- 路径与日历 ----------
-    def _minute_path(self, ds: str) -> Path:
-        return (
-            self.dir
-            / f"ashare_1m_stock/year={ds[:4]}/month={ds[4:6]}/day={ds[6:]}/data.parquet"
-        )
+    def l2_auction_day(self, ds: str) -> dict[str, tuple[float, float]]:
+        """某日 L2 集合竞价 ``{code: (hq_px, business_amount)}``（懒加载 + 缓存）。"""
+        if not self._has_l2:
+            return {}
+        v = self.cache.l2_auction.get(ds)
+        if v is not MISSING:
+            return v
+        df = self.src.l2_auction(ds)
+        out: dict[str, tuple[float, float]] = {}
+        if df is not None and df.height:
+            for c, p, a in zip(df["code"], df["hq_px"], df["business_amount"], strict=False):
+                out[str(c)] = (float(p), float(a))
+        self.cache.l2_auction.put(ds, out)
+        return out
 
-    def _daily_path(self, ds: str) -> Path:
-        return (
-            self.dir
-            / f"ashare_1d_stock/year={ds[:4]}/month={ds[4:6]}/day={ds[6:]}/data.parquet"
-        )
-
+    # ---------- 日历 ----------
     def day_index(self, ds: str) -> int:
         return self._day_pos[ds]
 
@@ -378,39 +347,38 @@ class DataFeed:
         i = self.day_index(ds)
         return self.trade_days[i - 1] if i > 0 else None
 
-    def days_upto(self, ds: str, count: int) -> list[str]:
-        i = self.day_index(ds)
-        return self.trade_days[max(0, i - count + 1) : i + 1]
-
     def days_between(self, a: str, b: str) -> list[str]:
         ia = bisect_left(self.trade_days, a)
         ib = bisect_right(self.trade_days, b)
         return self.trade_days[ia:ib]
 
-    # ---------- 分钟数据 ----------
+    # ---------- 分钟数据（流式：按内存预算滚动） ----------
     def minute_day(self, ds: str) -> DayMinuteData | None:
-        """获取某日分钟数据（缓存未命中则加载）。"""
-        md = self._minute_cache.get(ds)
-        if md is not None or ds in self._minute_cache:
-            self._minute_cache.move_to_end(ds)
-            return md
-        md = _load_minute_day(self._minute_path(ds))
-        self._minute_cache[ds] = md
-        if self.preload_mode != "all":
-            while len(self._minute_cache) > self.rolling_window:
-                self._minute_cache.popitem(last=False)
+        """获取某日分钟数据（缓存未命中则加载）。
+
+        流式语义：缓存按**内存预算**逐出（默认取可用内存的 25%），
+        而不是按固定天数 —— 内存充裕时自然多留几天，紧张时自动少留，
+        长区间回测内存占用平稳、不随区间线性增长。
+        """
+        v = self.cache.minute.get(ds)
+        if v is not MISSING:
+            return v  # 命中（含「该日缺失」的 None 记录）
+        md = _load_minute_day(self.src.minute_day(ds))
+        self.cache.minute.put(ds, md)
         return md
 
     def preload(self, progress: bool = True) -> None:
-        """预热整载：并行预读区间内全部分钟日文件。"""
+        """预热加载（**非默认**）：并行预读区间内全部分钟日。
+
+        ⚠️ 流式模式下不调用本方法；仅在明确需要"全量常驻"时使用，
+        且应先用 :func:`ptrade_sim.resources.decide` 确认内存吃得下。
+        """
         days = self.range_days
-        logger.info(
-            f"开始预热加载 {len(days)} 个交易日的分钟数据（threads={self.threads}）..."
-        )
+        logger.info(f"开始预热加载 {len(days)} 个交易日的分钟数据（threads={self.threads}）...")
         t0 = datetime.now()
 
         def _work(ds):
-            return ds, _load_minute_day(self._minute_path(ds))
+            return ds, _load_minute_day(self.src.minute_day(ds))
 
         with ThreadPoolExecutor(max_workers=self.threads) as ex:
             futs = [ex.submit(_work, ds) for ds in days]
@@ -419,108 +387,107 @@ class DataFeed:
                 it = tqdm(it, total=len(futs), desc="预热分钟数据", unit="天")
             for fut in it:
                 ds, md = fut.result()
-                self._minute_cache[ds] = md
-        # 保持区间顺序
-        self._minute_cache = OrderedDict((d, self._minute_cache[d]) for d in days)
+                self.cache.minute.put(ds, md)
         secs = (datetime.now() - t0).total_seconds()
         logger.info(
-            f"预热完成：{len(days)} 天，耗时 {secs:.1f}s，估算内存 {len(days) * 40:.0f}MB"
+            f"预热完成：{len(days)} 天，耗时 {secs:.1f}s，"
+            f"缓存 {len(self.cache.minute)} 项 / "
+            f"{self.cache.minute.stats.bytes / 1048576:,.0f}MB"
         )
 
-    # ---------- 日线数据 ----------
-    def ensure_daily(self, ds: str) -> pd.DataFrame | None:
-        """某日全市场日线（索引为 PTrade 代码）。"""
-        if ds in self._daily_cache:
-            return self._daily_cache[ds]
-        df = None
-        if self._daily_path(ds).exists():
-            d = pl.read_parquet(
-                self._daily_path(ds),
-                columns=[
-                    "code",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "pre_close",
-                    "vol",
-                    "amount",
-                    "adj_factor",
-                    "is_st",
-                    "is_delisted",
-                    "name",
-                ],
-            )
-            d = d.with_columns(pl.col("code").str.replace(".SH", ".SS", literal=True))
-            df = d.to_pandas().set_index("code")
-        self._daily_cache[ds] = df
+    def cache_report(self) -> dict:
+        """缓存统计（供回测结束后的资源报告）。"""
+        return {
+            "config": self.cache.describe(),
+            "caches": self.cache.report(),
+            "stats": self.cache.stats(),
+        }
+
+    # ---------- 日线数据（内部全程 polars） ----------
+    def ensure_daily(self, ds: str) -> pl.DataFrame | None:
+        """某日全市场日线（**polars**，列为 PTrade 口径）。"""
+        v = self.cache.daily.get(ds)
+        if v is not MISSING:
+            return v
+        d = self.src.daily(ds)
+        df = d if (d is not None and d.height) else None
+        self.cache.daily.put(ds, df)
         return df
 
     def daily_rows(self, ds: str) -> dict[str, dict] | None:
-        """某日全市场日线 -> {code: row_dict}，懒构建一次并缓存（替代逐行 df.loc）。"""
-        cached = self._daily_rows.get(ds)
-        if cached is not None:
-            return cached
+        """某日全市场日线 -> {code: row_dict}，懒构建一次并缓存。
+
+        这是**最热**的取数路径（每次下单/涨跌停判定都会调到）。
+        直接从 polars 列构建行字典，省掉「polars → pandas → dict」两次转换。
+        """
+        v = self.cache.daily_rows.get(ds)
+        if v is not MISSING:
+            return v
         df = self.ensure_daily(ds)
         if df is None:
             return None
-        rows = df.to_dict("index")
-        self._daily_rows[ds] = rows
+        cols = df.columns
+        rows = {row[0]: dict(zip(cols, row, strict=False)) for row in df.iter_rows()}
+        self.cache.daily_rows.put(ds, rows)
         return rows
 
     def basic_dict(self) -> dict[str, dict]:
-        """基本表 -> {code: row_dict}，懒构建一次（替代逐行 basic.loc）。"""
-        if self._basic_dict is None:
-            self._basic_dict = (
-                self.basic.to_dict("index") if len(self.basic) else {}
+        """基本表 -> {code: row_dict}，懒构建一次（替代逐行定位）。"""
+        v = self.cache.static.get("basic_dict")
+        if v is MISSING:
+            cols = self.basic.columns
+            v = (
+                {row[0]: dict(zip(cols, row, strict=False)) for row in self.basic.iter_rows()}
+                if self.basic.height
+                else {}
             )
-        return self._basic_dict
+            self.cache.static.put("basic_dict", v)
+        return v
 
     def is_st_map(self, ds: str) -> dict[str, int]:
-        """某日 {code: is_st}，懒构建一次并缓存（替代 Series.items 逐项迭代）。"""
-        cached = self._st_cache.get(ds)
-        if cached is not None:
-            return cached
+        """某日 {code: is_st}，懒构建一次并缓存。"""
+        v = self.cache.st_feat.get(ds)
+        if v is not MISSING:
+            return v
         df = self.ensure_daily(ds)
-        if df is None or "is_st" not in df.columns:
-            self._st_cache[ds] = {}
-            return {}
-        self._st_cache[ds] = df["is_st"].astype(int).to_dict()
-        return self._st_cache[ds]
-
-    def _feature_path(self, ds: str) -> Path:
-        return (
-            self.dir
-            / f"ashare_1d_feature/year={ds[:4]}/month={ds[4:6]}/day={ds[6:]}/data.parquet"
+        m = (
+            {str(c): int(s) for c, s in zip(df["code"], df["is_st"], strict=False)}
+            if df is not None and "is_st" in df.columns
+            else {}
         )
+        self.cache.st_feat.put(ds, m)
+        return m
 
-    def ensure_feature(self, ds: str) -> pd.DataFrame | None:
-        """某日全市场估值/股本数据（ashare_1d_feature，索引为 PTrade 代码）。"""
-        if ds in self._feature_cache:
-            return self._feature_cache[ds]
-        df = None
-        if self._feature_path(ds).exists():
-            d = pl.read_parquet(
-                self._feature_path(ds),
-                columns=["code", "total_mv", "circ_mv", "float_share", "total_share"],
-            )
-            d = d.with_columns(pl.col("code").str.replace(".SH", ".SS", literal=True))
-            df = d.to_pandas().set_index("code")
-        self._feature_cache[ds] = df
+    def ensure_feature(self, ds: str) -> pl.DataFrame | None:
+        """某日全市场估值/股本数据（**polars**）。
+
+        列名已由数据源层统一为 PTrade valuation 口径
+        （``total_value``/``float_value``/``a_floats``/``total_shares``）。
+        """
+        v = self.cache.feature.get(ds)
+        if v is not MISSING:
+            return v
+        d = self.src.feature(ds)
+        df = d if (d is not None and d.height) else None
+        self.cache.feature.put(ds, df)
         return df
 
-    def valuation_frame(self, codes: list[str], ds: str) -> pd.DataFrame:
-        """估值数据（get_fundamentals('valuation')）：index=code, columns=[total_value, float_value]（单位：元）。"""
+    def valuation_frame(self, codes: list[str], ds: str) -> pl.DataFrame:
+        """估值数据（**polars**）：columns=[code, total_value, float_value]（单位：元）。
+
+        仅保留 ``total_value`` 非空的行 —— 与旧 pandas 版 `reindex + notna` 语义一致。
+        """
+        empty = pl.DataFrame(
+            schema={"code": pl.String, "total_value": pl.Float64, "float_value": pl.Float64}
+        )
         feat = self.ensure_feature(ds)
         if feat is None:
-            return pd.DataFrame(columns=["total_value", "float_value"])
-        sub = feat.reindex(codes)
-        mask = sub["total_mv"].notna()
-        if not mask.any():
-            return pd.DataFrame(columns=["total_value", "float_value"])
-        out = sub.loc[mask, ["total_mv", "circ_mv"]].astype(float)
-        out.columns = ["total_value", "float_value"]
-        return out
+            return empty
+        sub = feat.filter(pl.col("code").is_in(codes)).select(
+            ["code", "total_value", "float_value"]
+        )
+        sub = sub.filter(pl.col("total_value").is_not_null())
+        return sub if sub.height else empty
 
     def daily_row(self, ds: str, code: str) -> dict | None:
         rows = self.daily_rows(ds)
@@ -534,59 +501,211 @@ class DataFeed:
 
     def adj_factor(self, ds: str, code: str) -> float | None:
         row = self.daily_row(ds, code)
-        return float(row["adj_factor"]) if row else None
+        if not row:
+            return None
+        # 注意：row 存在但该列可能为 NULL（契约未标 NOT NULL）。
+        # 原写法 float(row["adj_factor"]) 对 None 会抛 TypeError，
+        # 进而让 fq='pre'/'post' 的取数整段失败。
+        v = row.get("adj_factor")
+        return float(v) if v is not None else None
 
     def benchmark_close(self, code: str, ds: str) -> float | None:
-        """基准指数日线收盘（code 为 PTrade 代码，index_daily 键已统一为 PTrade 代码）。"""
-        df = self.index_daily.get(code)
-        if df is None or ds not in df.index:
+        """基准指数日线收盘（code 为 PTrade 代码）。"""
+        per_day = self.index_daily.get(code)
+        if not per_day:
             return None
-        return float(df.loc[ds, "close"])
+        return per_day.get(ds)
 
     # ---------- 证券信息 ----------
     def stock_name(self, code: str, cur_day: str) -> str | None:
-        """按回测日生效的证券名称：更名历史优先，回退当日日线 name，再回退基本表。"""
-        cur = f"{cur_day[:4]}-{cur_day[4:6]}-{cur_day[6:]}"
-        for chg, nm in reversed(self.name_changes.get(code, [])):
-            if chg <= cur:
-                return nm
+        """按回测日生效的证券简称（三点优先）：
+
+        1. **当日日线 ``name``** —— 最准（源日线 name 已实测为时点正确）
+        2. 日线派生的**更名时点**中 ``<= cur_day`` 的最近一条 ——
+           覆盖停牌等当日无日线行情的情况（避免回退到"当前简称"）
+        3. 基本表 ``name`` —— 兜底（无任何日线数据时，如覆盖区间之前）
+        """
         row = self.daily_row(cur_day, code)
         if row and row.get("name"):
             return str(row["name"])
-        if code in self.basic.index:
-            return str(self.basic.loc[code, "name"])
+        cur = day_iso(cur_day)
+        for chg, nm in reversed(self.name_changes.get(code, [])):
+            if chg <= cur:
+                return nm
+        b = self.basic_dict().get(code)
+        if b and b.get("name"):
+            return str(b["name"])
         return None
 
     def get_Ashares(self, cur_day: str) -> list[str]:
         """指定日主板 A 股列表（缓存）。"""
-        if cur_day in self._ashares_cache:
-            return self._ashares_cache[cur_day]
-        cur = f"{cur_day[:4]}-{cur_day[4:6]}-{cur_day[6:]}"
-        b = self.basic
-        mask = (
-            (b["market"] == "主板")
-            & (b["list_status"] == "L")
-            & (b["list_date"].notna())
-        )
-        mask &= b["list_date"].str[:4].str.isnumeric()  # 防脏数据
-        listed = b[mask]
+        ck = ("ashares", cur_day)
+        v = self.cache.static.get(ck)
+        if v is not MISSING:
+            return v
+        cur = day_iso(cur_day)
+        # 全程 polars：过滤在引擎内完成，避免把 5000+ 行逐行迭代出来
+        listed = self.basic.filter(
+            (pl.col("market") == "主板")
+            & (pl.col("list_status") == "L")
+            & pl.col("list_date").is_not_null()
+            & pl.col("list_date").str.slice(0, 4).str.contains(r"^\d{4}$")  # 防脏数据
+        ).select(["code", "list_date", "delist_date"])
         result = []
-        for code, row in listed.iterrows():
+        for code, ld, dl in zip(
+            listed["code"], listed["list_date"], listed["delist_date"], strict=False
+        ):
+            code = str(code)
             p3 = code[:3]
             if not (
                 (code.endswith(".SZ") and p3 in _MAINBOARD_PREFIX)
                 or (code.endswith(".SS") and p3 in _MAINBOARD_PREFIX_SH)
             ):
                 continue
-            if str(row["list_date"]) > cur:
+            if str(ld) > cur:
                 continue
-            dl = row["delist_date"]
-            if pd.notna(dl) and str(dl) <= cur:
+            if dl is not None and str(dl) <= cur:
                 continue
             result.append(code)
         result.sort()
-        self._ashares_cache[cur_day] = result
+        self.cache.static.put(ck, result)
         return result
+
+    # ---------- 指数成分与权重（ashare_index_weight） ----------
+    def index_members(self) -> dict[str, dict]:
+        """指数成分与权重表（懒加载一次并缓存）。
+
+        返回 ``{指数代码(6位): info}``，``info`` 为：
+
+        ================  ====================================================
+        ``rows``          ``[(成分股PTrade码, in_date, out_date, weight), ...]``
+        ``index_name``    指数名称
+        ``source``        ``ptrade``（权重拉链表）/ ``baostock``（时点精确）/ ``akshare``（仅快照）
+        ``snapshot_date`` 快照源抓取日；**非空即表示该指数不具备时点查询能力**
+        ``min_in``/``max_in``  区间起止，用于诊断「日期超出覆盖范围」
+        ================  ====================================================
+
+        表缺失或读取失败 → 空 dict（上层降级为空列表，不抛错）。
+        由用户向 DuckDB 写入（见 ``data_contract.INDEX_WEIGHT``）。
+        """
+        v = self.cache.static.get("index_members")
+        if v is not MISSING:
+            return v
+        members: dict[str, dict] = {}
+        df = self.src.reference("ashare_index_weight")
+        if df is None or df.height == 0:
+            logger.warning(
+                f"缺少指数成分权重表 ashare_index_weight（{self.src.describe()}）"
+                f"→ get_index_stocks 返回空列表"
+            )
+            self.cache.static.put("index_members", members)
+            return members
+
+        # 兼容旧版表（无 snapshot_date / weight 列）：按 source 推断能力
+        cols = set(df.columns)
+        has_w = "weight" in cols
+        for r in df.iter_rows(named=True):
+            ic = norm_index_code(r["index_code"])
+            info = members.get(ic)
+            if info is None:
+                info = {
+                    "rows": [],
+                    "index_name": str(r.get("index_name") or ic),
+                    "source": str(r.get("source") or ""),
+                    "snapshot_date": "",
+                    "min_in": "",
+                    "max_in": "",
+                }
+                members[ic] = info
+            i_d, o_d = str(r.get("in_date") or ""), str(r.get("out_date") or "")
+            w = r.get("weight") if has_w else None
+            info["rows"].append((str(r["code"]), i_d, o_d, w))
+            sd = str(r.get("snapshot_date") or "") if "snapshot_date" in cols else ""
+            if sd:
+                info["snapshot_date"] = sd
+            if i_d:
+                if not info["min_in"] or i_d < info["min_in"]:
+                    info["min_in"] = i_d
+                if not info["max_in"] or i_d > info["max_in"]:
+                    info["max_in"] = i_d
+
+        # 无 snapshot_date 列的旧表：akshare 源一律视为快照（其 out_date 恒空）
+        for info in members.values():
+            if not info["snapshot_date"] and info["source"] == "akshare":
+                info["snapshot_date"] = info["max_in"] or "99999999"
+
+        total = sum(len(v["rows"]) for v in members.values())
+        n_snap = sum(1 for v in members.values() if v["snapshot_date"])
+        logger.info(
+            f"指数成分表已加载：{len(members)} 个指数 / {total} 条记录"
+            f"（其中 {n_snap} 个为快照源，不具备时点查询能力）"
+        )
+        self.cache.static.put("index_members", members)
+        return members
+
+    def index_member_info(self, index_code: str) -> dict | None:
+        """单指数元信息（供上层构造精确告警）。"""
+        return self.index_members().get(norm_index_code(index_code))
+
+    def index_stocks(self, index_code: str, ds: str) -> list[str]:
+        """某指数在 ``ds``（YYYYMMDD）的成分股（简单接口，仅返回代码）。
+
+        需要区分「空结果的原因」时用 :meth:`index_query`。
+        """
+        return self.index_query(index_code, ds).codes
+
+    def index_query(self, index_code: str, ds: str) -> IndexQuery:
+        """某指数在 ``ds`` 的成分股 + 诊断原因（:class:`IndexQuery`）。
+
+        ``reason`` 取值：
+
+        ==================  ========================================================
+        ``ok``              时点查询成功（数据源具备该能力）
+        ``no_table``        成分表缺失
+        ``unknown_index``   指数码不在表中
+        ``before_coverage`` 查询日早于表覆盖起点（源无更早数据，非「当日无成分」）
+        ``snapshot_bias``   快照源 + 历史日期 → 返回的是**当前**成分，含幸存者偏差
+        ==================  ========================================================
+
+        ⚠️ **快照源（akshare）不做区间过滤**：其 ``out_date`` 恒为空，
+        若按 ``in_date <= ds < out_date`` 过滤，会把「当前成分中纳入日期晚于 ds 的股票」
+        全部剔除，得到**极小且看似合理**的成分数
+        （实测创业板指 2015 年只返回 12 只、实际 100 只），静默产出错误股票池。
+        故快照源一律返回完整当前成分，并由 ``reason`` 提示偏差。
+        """
+        # 结果缓存：同一 (指数, 日期) 重复查询直接命中。
+        # 必要性：策略可能在 handle_data 中逐 bar 调用（241 次/日），
+        # 而成分区间是「按日」变化的 —— 无缓存时 5 年回测约 6.7 亿次比较。
+        ck = (norm_index_code(index_code), ds)
+        hit = self.cache.index_query.get(ck)
+        if hit is not MISSING:
+            return hit
+
+        if not self.index_members():
+            res = IndexQuery([], "no_table")
+        else:
+            info = self.index_member_info(index_code)
+            if info is None:
+                res = IndexQuery([], "unknown_index")
+            else:
+                use_ds = ds or self.end_day
+                if info["snapshot_date"]:
+                    codes = sorted({row[0] for row in info["rows"]})
+                    res = IndexQuery(
+                        codes, "ok" if use_ds >= info["snapshot_date"] else "snapshot_bias"
+                    )
+                else:
+                    codes = [
+                        row[0]
+                        for row in info["rows"]
+                        if (not row[1] or row[1] <= use_ds) and (not row[2] or use_ds < row[2])
+                    ]
+                    if not codes and info["min_in"] and use_ds < info["min_in"]:
+                        res = IndexQuery([], "before_coverage")
+                    else:
+                        res = IndexQuery(sorted(codes), "ok")
+        self.cache.index_query.put(ck, res)
+        return res
 
 
 # ============================================================
@@ -779,23 +898,37 @@ class BacktestEngine:
         self.fixed_slippage: float | None = None
         self._limit_mode = "LIMITED"  # 成交数量限制模式（set_limit_mode 设置）
         self.benchmark = config.get("benchmark", "000300.SS")
-        # 全市场日线 get_price 批缓存（同参数重复调用命中，结果隔离副本）
-        self._get_price_cache: dict[tuple, pd.DataFrame] = {}
-        # 按交易日重置的证券信息缓存（get_stock_name/get_stock_info）
+        # 每交易日重置的缓存（清理见 _run_day）：
+        #   _name_cache / _info_cache  —— get_stock_name / get_stock_info
+        #   history._price_cache       —— get_price 的全市场批缓存（codes > 500 时启用）
         self._name_cache: dict[tuple[str, str], str | None] = {}
         self._info_cache: dict[tuple, dict] = {}
 
         preload = config.get("preload", {})
         self.feed = DataFeed(
-            config["data_dir"],
-            config["start_date"].replace("-", ""),
-            config["end_date"].replace("-", ""),
-            preload_mode=preload.get("mode", "all"),
+            db_path=config["db_path"],
+            start_day=config["start_date"].replace("-", ""),
+            end_day=config["end_date"].replace("-", ""),
+            preload_mode=preload.get("mode", "rolling"),
             rolling_window=int(preload.get("rolling_window_days", 10)),
             threads=int(preload.get("threads", 8)),
+            cache_config=CacheConfig.from_dict(config.get("cache")),
         )
 
-        self.capital_base = float(config.get("capital_base", 1_000_000))
+        # 兜底引用 config.DEFAULT_CAPITAL_BASE（唯一权威），避免这里再写一个魔数
+        # 与 runstore / 看板的兜底值不一致。
+        self.capital_base = float(config.get("capital_base", DEFAULT_CAPITAL_BASE))
+        # 回测周期：minute（默认，241 槽/日）| daily（每日一次，15:00）
+        freq = str(config.get("frequency", "minute")).strip().lower()
+        if freq in ("1d", "d", "day"):
+            freq = "daily"
+        elif freq in ("1m", "m", "min"):
+            freq = "minute"
+        if freq not in ("minute", "daily"):
+            logger.warning(f"未知 frequency={config.get('frequency')!r}，回退 minute")
+            freq = "minute"
+        self.frequency = freq
+        self._daily_mode = freq == "daily"
         self.portfolio = Portfolio(self.capital_base)
         self.g = SimpleNamespace()
         self.blotter = SimpleNamespace(current_dt=None)
@@ -806,26 +939,131 @@ class BacktestEngine:
         self.orders: dict[str, Order] = {}
         self.trades: list[Trade] = []
         self._order_seq = 0
-        self._day_str: str = ""
-        self._slot_pos = -1  # 当前槽位（-1 = 盘前）
-        self._initialized = False
+        # 回测时钟：与 HistoryProvider **共享同一实例**，避免双份状态。
+        # _day_str / _slot_pos 是它的 property（见下方），故原有 17 处调用点不变。
+        self.clock = Clock()
         self._failed_funcs: set[str] = set()
         self.daily_stats: list[dict] = []
-        self._callbacks = {}
+        # 历史数据取数与组装（日线/分钟/复权/重采样/价格区间/交易日）
+        self.history = HistoryProvider(self.feed, self.clock, daily_mode=self._daily_mode)
+        # 一次性告警去重：(指数码, 原因) / 未实现的占位 API
+        self._warned_index_stocks: set[tuple[str, str]] = set()
+        self._stub_warned: set[str] = set()
 
-        # 日志双写
-        logger.remove()
-        logger.add(
-            lambda m: print(m, end=""),
-            level="INFO",
-            format="{time:HH:mm:ss} {level} {message}",
-        )
+        # 日志：引擎**只追加**运行日志文件，不动全局 handler。
+        #
+        # ⚠️ 这里刻意**不调用 logger.remove()**：
+        # 1. 控制台输出是 CLI（cli._setup_console_logging）的职责，引擎重复一份会双打；
+        # 2. 引擎是可被嵌入的库（测试、notebook、看板服务都会直接构造它），
+        #    清空全局 handler 会把宿主自己的日志配置一起干掉 —— 曾导致
+        #    测试里的告警捕获全部失效。
         logger.add(
             self.output_dir / "output.log",
             level="INFO",
             format="{time:YYYY-MM-DD HH:mm:ss} {level} {message}",
             encoding="utf-8",
         )
+
+        # ---------- 实时进度（供看板轮询 progress.json） ----------
+        self._started_at = datetime.now()
+        self._progress_path = self.output_dir / "progress.json"
+        self._progress = {
+            "status": "running",
+            "phase": "starting",
+            "started_at": self._started_at.isoformat(timespec="seconds"),
+            "strategy": self.strategy_path,
+            "start_date": config["start_date"],
+            "end_date": config["end_date"],
+            "capital_base": self.capital_base,
+            "benchmark": self.benchmark,
+            "total_days": len(self.feed.range_days),
+            "day_done": 0,
+            "current_date": "",
+            "elapsed_sec": 0.0,
+        }
+        self._write_progress()
+
+    # ---------- 回测时钟（property 转发到共享 Clock） ----------
+    # 用 property 而不是普通属性，是为了让「引擎」与「HistoryProvider」看到的是
+    # 同一个交易日/槽位。若各自存一份，极易出现「引擎已翻日、取数仍按上一日算」，
+    # 而这类偏差不会报错、只会让结果悄悄错掉。
+    @property
+    def _day_str(self) -> str:
+        return self.clock.day
+
+    @_day_str.setter
+    def _day_str(self, v: str) -> None:
+        self.clock.day = v
+
+    @property
+    def _slot_pos(self) -> int:
+        return self.clock.slot
+
+    @_slot_pos.setter
+    def _slot_pos(self, v: int) -> None:
+        self.clock.slot = v
+
+    def data_gaps(self) -> dict:
+        """回看窗口越界汇总（供 CLI 写入 summary.json 的 data_gaps）。"""
+        return self.history.data_gaps()
+
+    def _write_progress(self, **updates) -> None:
+        """合并更新字段并原子写入 progress.json；失败仅告警，不打断回测。"""
+        self._progress.update(updates)
+        self._progress["elapsed_sec"] = round(
+            (datetime.now() - self._started_at).total_seconds(), 1
+        )
+        try:
+            _atomic_write_text(
+                self._progress_path,
+                json.dumps(self._progress, ensure_ascii=False, indent=2),
+            )
+        except Exception as exc:
+            logger.warning(f"progress.json 写入失败：{exc}")
+
+    def _save_strategy_source(self) -> None:
+        """把策略源码与**生效配置**复制到 run 目录，保证 run 自含可复现信息。
+
+        - ``strategy_source.py``：策略文件可能日后被删/改名，副本保证能回读源码
+        - ``strategy_config.json``：策略级配置（含展示名 ``name``），看板据此显示，
+          是展示名的唯一来源
+        - ``run_config.json``：**合并后的完整生效配置**（含 CLI/env 覆盖），
+          日后想复现这次回测，看这一个文件即可
+
+        失败仅告警不中断（不能因为写副本失败就让回测挂掉）。
+        """
+        src = Path(self.strategy_path)
+        try:
+            if src.exists() and src.is_file():
+                dst = self.output_dir / "strategy_source.py"
+                dst.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+                self._progress["strategy_source"] = str(dst)
+                logger.info(f"策略源码副本已保存：{dst}")
+            else:
+                logger.warning(f"策略源码不存在，跳过保存副本：{self.strategy_path}")
+        except Exception as exc:
+            logger.warning(f"策略源码副本保存失败：{exc}")
+
+        # 策略级配置原样留档（看板读它取展示名）
+        try:
+            sc = self.config.get("strategy_config")
+            if isinstance(sc, dict) and sc:
+                (self.output_dir / "strategy_config.json").write_text(
+                    json.dumps(sc, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+        except Exception as exc:
+            logger.warning(f"策略配置留档失败：{exc}")
+
+        # 生效配置留档（去掉体积大又无信息量的 preload 与路径）
+        try:
+            eff = {k: v for k, v in self.config.items() if k not in ("preload",)}
+            (self.output_dir / "run_config.json").write_text(
+                json.dumps(eff, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning(f"生效配置留档失败：{exc}")
 
     # ---------- context ----------
     def _make_context(self) -> SimpleNamespace:
@@ -834,7 +1072,7 @@ class BacktestEngine:
             portfolio=self.portfolio,
             blotter=self.blotter,
             sim_params=SimpleNamespace(
-                capital_base=self.capital_base, data_frequency="minute"
+                capital_base=self.capital_base, data_frequency=self.frequency
             ),
             slippage=SimpleNamespace(),
             commission=SimpleNamespace(),
@@ -845,367 +1083,48 @@ class BacktestEngine:
 
     # ---------- 策略加载 ----------
     def load_strategy(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "ptrade_strategy", self.strategy_path
-        )
+        spec = importlib.util.spec_from_file_location("ptrade_strategy", self.strategy_path)
+        loader = spec.loader if spec is not None else None
+        if spec is None or loader is None:
+            raise StrategyImportError(
+                f"无法加载策略文件（不是有效的 Python 模块）：{self.strategy_path}"
+            )
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        loader.exec_module(module)
         # 注入 API 到策略模块全局命名空间
         api = self._build_api()
         for name, obj in api.items():
             setattr(module, name, obj)
         self._module = module
         if not hasattr(module, "initialize"):
-            raise ValueError("策略缺少必选函数 initialize(context)")
+            raise StrategyError("策略缺少必选函数 initialize(context)")
         module.initialize(self.context)
         self.context.initialized = True
-        self._initialized = True
         if not hasattr(module, "handle_data"):
             logger.warning("策略未定义 handle_data（官方必选），引擎将跳过每 bar 调用")
         logger.info(f"策略加载完成：{self.strategy_path}")
 
     # ---------- API 构造 ----------
     def _build_api(self) -> dict:
-        e = self
-        log = SimpleNamespace(
-            info=lambda msg, *a: logger.info(e._fmt_log(msg, a)),
-            warn=lambda msg, *a: logger.warning(e._fmt_log(msg, a)),
-            warning=lambda msg, *a: logger.warning(e._fmt_log(msg, a)),
-            error=lambda msg, *a: logger.error(e._fmt_log(msg, a)),
-            debug=lambda msg, *a: logger.debug(e._fmt_log(msg, a)),
-        )
+        """把 PTrade API 装成字典 —— 实现在 :mod:`ptrade_sim.api`。
 
-        def set_universe(universe):
-            e.universe = [
-                to_ptrade_code(u)
-                for u in (
-                    universe if isinstance(universe, (list, tuple, set)) else [universe]
-                )
-            ]
+        这里只做转发。原先 55 个 API 全挤在本方法里（501 行 / 52 个闭包），
+        现在按官方分类拆成 6 个工厂；``runtime`` 只负责把引擎实例交给它。
+        """
+        return build_api(self)
 
-        def set_benchmark(security):
-            e.benchmark = to_ptrade_code(security)
+    def _empty_position(self, code: str) -> Position:
+        """无持仓时的空 :class:`Position`（``amount == 0``）—— 官方语义。
 
-        def set_commission(commission_ratio=0.0003, min_commission=5.0, type="STOCK"):
-            e.commission_ratio = float(commission_ratio)
-            e.min_commission = float(min_commission)
-
-        def set_slippage(slippage=0.001):
-            e.slippage_ratio = float(slippage)
-            e.fixed_slippage = None
-
-        def set_fixed_slippage(fixed_slippage=0.0):
-            e.fixed_slippage = float(fixed_slippage)
-
-        def set_limit_mode(mode="LIMITED"):
-            # LIMITED：限制涨跌停成交（拒一字板）；UNLIMITED：不限制
-            e._limit_mode = str(mode).upper()
-
-        def run_daily(context, func, time="9:31"):
-            t = str(time).strip()
-            hh, mm = t.split(":")[:2]
-            key = f"{int(hh):02d}:{int(mm):02d}"
-            if key == "13:00":  # 官方：13:00 触发对应下午开盘
-                key = "13:01"
-            e.schedule.setdefault(key, []).append(func)
-
-        def order(security, amount, limit_price=None):
-            return e._order(to_ptrade_code(security), int(amount))
-
-        def order_value(security, value):
-            return e._order_by_value(to_ptrade_code(security), float(value))
-
-        def order_target(security, amount):
-            return e._order_target(to_ptrade_code(security), int(amount))
-
-        def order_target_value(security, value):
-            return e._order_by_target_value(to_ptrade_code(security), float(value))
-
-        def get_history(
-            count,
-            frequency="1d",
-            field="close",
-            security_list=None,
-            fq=None,
-            include=False,
-            fill="nan",
-            is_dict=False,
-        ):
-            return e._get_history(
-                int(count), frequency, field, security_list, fq, include, is_dict
-            )
-
-        def get_price(
-            security,
-            start_date=None,
-            end_date=None,
-            frequency="1d",
-            fields=None,
-            fq=None,
-            count=None,
-            is_dict=False,
-        ):
-            return e._get_price(
-                security, start_date, end_date, frequency, fields, fq, count, is_dict
-            )
-
-        def get_trend_data(date=None, stocks=None):
-            return e._get_trend_data(stocks)
-
-        def get_stock_name(stocks):
-            codes = [
-                to_ptrade_code(s)
-                for s in (stocks if isinstance(stocks, (list, tuple)) else [stocks])
-            ]
-            # 官方：始终返回 dict（str 入参也返回 {code: name}）
-            out = {}
-            for c in codes:
-                key = (e._day_str, c)
-                nm = e._name_cache.get(key)
-                if nm is None and key not in e._name_cache:
-                    nm = e.feed.stock_name(c, e._day_str)
-                    e._name_cache[key] = nm
-                out[c] = nm
-            return out
-
-        def get_stock_info(stocks, field=None):
-            codes = [
-                to_ptrade_code(s)
-                for s in (stocks if isinstance(stocks, (list, tuple)) else [stocks])
-            ]
-            fields = field if (field is None or isinstance(field, list)) else [field]
-            out = {}
-            for c in codes:
-                ck = (e._day_str, c, tuple(fields) if fields is not None else None)
-                if ck in e._info_cache:
-                    out[c] = e._info_cache[ck]
-                    continue
-                item = {}
-                b = e.feed.basic_dict()
-                row = b.get(c)
-                if row:
-                    ld = row.get("list_date")
-                    dd = row.get("delist_date")
-                    item["stock_name"] = (
-                        None if pd.isna(row.get("name")) else str(row["name"])
-                    )
-                    item["listed_date"] = (
-                        None
-                        if pd.isna(ld)
-                        else f"{str(ld)[:4]}-{str(ld)[4:6]}-{str(ld)[6:]}"
-                    )
-                    item["de_listed_date"] = (
-                        "2900-01-01"
-                        if pd.isna(dd)
-                        else f"{str(dd)[:4]}-{str(dd)[4:6]}-{str(dd)[6:]}"
-                    )
-                else:
-                    item = {
-                        "stock_name": None,
-                        "listed_date": None,
-                        "de_listed_date": None,
-                    }
-                if fields is None:
-                    # 官方：field 不入参时默认只返回 stock_name
-                    res = {"stock_name": item["stock_name"]}
-                else:
-                    res = {k: item.get(k) for k in fields}
-                e._info_cache[ck] = res
-                out[c] = res
-            # 官方：始终返回嵌套 dict（str 入参也返回 {code: {...}}）
-            return out
-
-        def get_stock_status(stocks, query_type="ST", query_date=None):
-            codes = [
-                to_ptrade_code(s)
-                for s in (stocks if isinstance(stocks, (list, tuple)) else [stocks])
-            ]
-            if query_type == "DELISTING_SORTING":
-                return {}  # 官方：仅交易场景支持当日查询
-            ds = e._norm_day(query_date) if query_date else e._day_str
-            out = {}
-            for c in codes:
-                out[c] = e._stock_status_one(c, query_type, ds)
-            return out
-
-        def get_Ashares(date=None):
-            ds = e._norm_day(date) if date else e._day_str
-            return list(e.feed.get_Ashares(ds))
-
-        def get_trade_days(start_date=None, end_date=None, count=None):
-            return e._get_trade_days(start_date, end_date, count)
-
-        def get_all_trades_days(date=None):
-            ds = e._norm_day(date) if date else e._day_str
-            days = e.feed.trade_days[: e.feed.day_index(ds) + 1]
-            return np.array([f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in days])
-
-        def get_trading_day(day=0):
-            days = e.feed.trade_days
-            i = min(max(e.feed.day_index(e._day_str) + int(day), 0), len(days) - 1)
-            d = days[i]
-            return date(int(d[:4]), int(d[4:6]), int(d[6:]))
-
-        def get_trading_day_by_date(query_date, day=0):
-            q = e._norm_day(query_date)
-            days = e.feed.trade_days
-            i = bisect_left(days, q)  # 非交易日 -> 下一交易日
-            i = min(max(i + int(day), 0), len(days) - 1)
-            return f"{days[i][:4]}-{days[i][4:6]}-{days[i][6:]}"
-
-        def check_limit(security):
-            return e._check_limit(to_ptrade_code(security))
-
-        def filter_stock_by_status(
-            stock_list, filter_types=("ST", "HALT", "DELISTING")
-        ):
-            if isinstance(filter_types, str):
-                filter_types = [filter_types]
-            st = get_stock_status(stock_list, "ST") if "ST" in filter_types else {}
-            halt = (
-                get_stock_status(stock_list, "HALT") if "HALT" in filter_types else {}
-            )
-            de = (
-                get_stock_status(stock_list, "DELISTING")
-                if "DELISTING" in filter_types
-                else {}
-            )
-            return [
-                c for c in stock_list if not (st.get(c) or halt.get(c) or de.get(c))
-            ]
-
-        def get_snapshot(security=None):
-            return e._get_snapshot(to_ptrade_code(security) if security else None)
-
-        def get_research_path():
-            return str(e.output_dir) + "/"
-
-        def get_fundamentals(stocks, statement="valuation", date=None, **kwargs):
-            """财务/估值数据。'valuation' 支持市值（ashare_1d_feature），其余报表本地无数据返回空。"""
-            ds = (
-                e._norm_day(date)
-                if date
-                else (e.feed.prev_day(e._day_str) or e._day_str)
-            )
-            codes = [
-                to_ptrade_code(s)
-                for s in (stocks if isinstance(stocks, (list, tuple)) else [stocks])
-            ]
-            if statement == "valuation":
-                return e.feed.valuation_frame(codes, ds)
-            logger.warning(
-                f"get_fundamentals：本地无财务表（{statement}），返回空 DataFrame"
-            )
-            return pd.DataFrame()
-
-        def get_index_stocks(index_code=None):
-            if not getattr(e, "_warned_index_stocks", False):
-                logger.warning(
-                    f"get_index_stocks({index_code})：本地无指数成分数据，返回空列表"
-                )
-                e._warned_index_stocks = True
-            return []
-
-        def get_market_list():
-            return pd.DataFrame(
-                {
-                    "finance_mic": ["SS", "SZ"],
-                    "finance_name": ["上海证券交易所", "深圳证券交易所"],
-                }
-            )
-
-        def get_market_detail(finance_mic):
-            return pd.DataFrame(
-                columns=["hq_type_code", "prod_code", "prod_name", "trade_time_rule"]
-            )
-
-        def cancel_order(order_or_id):
-            oid = (
-                order_or_id
-                if isinstance(order_or_id, str)
-                else getattr(order_or_id, "id", None)
-            )
-            od = e.orders.get(oid)
-            if od and od.status in ("filled",):
-                return False
-            if od:
-                od.status = "canceled"
-            return True
-
-        def get_open_orders():
-            return {
-                oid: od
-                for oid, od in e.orders.items()
-                if od.status not in ("filled", "canceled", "rejected")
-            }
-
-        def get_order(order_id):
-            return e.orders.get(order_id)
-
-        def get_orders():
-            return dict(e.orders)
-
-        def get_trades():
-            return {i: t for i, t in enumerate(e.trades)}
-
-        def _noop(*args, **kwargs):
-            return None
-
-        return {
-            "log": log,
-            "g": e.g,
-            "context": e.context,
-            "set_universe": set_universe,
-            "set_benchmark": set_benchmark,
-            "set_commission": set_commission,
-            "set_slippage": set_slippage,
-            "set_fixed_slippage": set_fixed_slippage,
-            "set_volume_ratio": _noop,
-            "set_limit_mode": set_limit_mode,
-            "set_yesterday_position": _noop,
-            "set_parameters": _noop,
-            "run_daily": run_daily,
-            "order": order,
-            "order_value": order_value,
-            "order_target": order_target,
-            "order_target_value": order_target_value,
-            "get_history": get_history,
-            "get_price": get_price,
-            "get_trend_data": get_trend_data,
-            "get_stock_name": get_stock_name,
-            "get_stock_info": get_stock_info,
-            "get_stock_status": get_stock_status,
-            "get_Ashares": get_Ashares,
-            "get_trade_days": get_trade_days,
-            "get_all_trades_days": get_all_trades_days,
-            "get_trading_day": get_trading_day,
-            "get_trading_day_by_date": get_trading_day_by_date,
-            "check_limit": check_limit,
-            "filter_stock_by_status": filter_stock_by_status,
-            "get_snapshot": get_snapshot,
-            "get_research_path": get_research_path,
-            "get_fundamentals": get_fundamentals,
-            "get_index_stocks": get_index_stocks,
-            "get_market_list": get_market_list,
-            "get_market_detail": get_market_detail,
-            "cancel_order": cancel_order,
-            "get_open_orders": get_open_orders,
-            "get_order": get_order,
-            "get_orders": get_orders,
-            "get_trades": get_trades,
-        }
+        官方 ``get_position`` 在无持仓时返回**空 Position**而非 ``None``，
+        策略据此可以无条件读 ``pos.amount``。构造放在引擎侧，
+        使 ``api.py`` 无需 import ``runtime``（避免循环依赖）。
+        """
+        return Position(code)
 
     @staticmethod
     def _fmt_log(msg, args) -> str:
         return msg if not args else f"{msg} {list(args)}"
-
-    # ---------- 工具 ----------
-    def _norm_day(self, d) -> str:
-        """'2025-01-02'/'20250102'/date/datetime -> 'YYYYMMDD'"""
-        if isinstance(d, (datetime, date)):
-            return d.strftime("%Y%m%d")
-        s = str(d).replace("-", "").replace(" ", "")[:8]
-        return s
 
     def _stock_status_one(self, code: str, query_type: str, ds: str) -> bool | None:
         if query_type == "ST":
@@ -1229,25 +1148,45 @@ class BacktestEngine:
                 return True
             row = b[code]
             dd = row.get("delist_date")
-            cur = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
-            return (row.get("list_status") == "D") or (pd.notna(dd) and str(dd) <= cur)
+            cur = day_iso(ds)
+            return (row.get("list_status") == "D") or (dd is not None and str(dd) <= cur)
         return None
 
-    def _check_limit(self, code: str) -> bool:
-        """当前 bar 是否处于涨跌停价格。"""
-        bar = self._bar_now(code)
-        if bar is None or self._slot_pos < 0:
-            return False
-        daily = self.feed.daily_row(self._day_str, code)
-        if daily is None:
-            return False
-        pct = _limit_pct(daily["is_st"], code, self._day_str)
-        up = _limit_price(daily["pre_close"], pct)
-        down = _limit_price(daily["pre_close"], -pct)
-        return bar.close >= up or bar.close <= down
+    def _check_limit(self, code: str, query_date: str | None = None) -> int:
+        """涨跌停**状态码**（官方语义）。
+
+        返回 ``1`` 涨停 / ``-1`` 跌停 / ``0`` 既不涨停也不跌停。
+
+        ``query_date`` 为 None 或当日时用**当前 bar 收盘价**判断；
+        给历史日期时用**该日收盘价**与**该日 preclose** 判断
+        （官方：历史日期一律以收盘价判断）。
+        """
+        ds = norm_day(query_date) if query_date else self._day_str
+        row = self.feed.daily_row(ds, code)
+        if row is None:
+            return 0
+        pct = limit_pct(row["is_st"], code, ds)
+        up = limit_price(row["preclose"], pct)
+        down = limit_price(row["preclose"], -pct)
+        if query_date is None or ds == self._day_str:
+            bar = self._bar_now(code)
+            close = float(bar[3]) if bar is not None else float(row["close"])
+        else:
+            close = float(row["close"])
+        if close >= up:
+            return 1
+        if close <= down:
+            return -1
+        return 0
 
     def _bar_now(self, code: str):
-        """当前槽位 bar 元组 (o,h,l,c,vol,amount)，盘前取 09:30 竞价 bar。"""
+        """当前 bar 元组 (o,h,l,c,vol,amount)。
+
+        - 分钟模式：当前槽位 bar，盘前取 09:30 竞价 bar
+        - 日线模式：当日日线 bar（供 15:00 单次调度使用）
+        """
+        if self._daily_mode:
+            return self._daily_bar(code)
         md = self.feed.minute_day(self._day_str)
         if md is None:
             return None
@@ -1257,12 +1196,36 @@ class BacktestEngine:
             return None
         return md.open[r], md.high[r], md.low[r], md.close[r], md.vol[r], md.amount[r]
 
+    def _daily_bar(self, code: str):
+        """当日日线 bar 元组 (o,h,l,c,volume,money)；无则 None。"""
+        row = self.feed.daily_row(self._day_str, code)
+        if row is None:
+            return None
+        return (
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+            float(row["volume"]),
+            float(row["money"]),
+        )
+
+    def _bar_has_volume(self, code: str) -> bool:
+        """当前可撮合 bar 是否有成交量（停牌/零成交则为 False）。"""
+        bar = self._bar_now(code)
+        return bar is not None and float(bar[4]) > 0
+
     def _match_price(self, code: str) -> float | None:
         """撮合价：
-        - 盘前任务（09:30 前，_slot_pos<0）：PTrade 09:26 市价单在 09:31 第一根完整分钟 bar
-          收盘时撮合 → 用 09:31 bar 的 **close**（实证：000065 11.53→PTrade成本11.533、000070 11.00→11.003 完全吻合）
-        - 盘中：用当前槽位 bar close
+
+        - 日线模式：当日**日线收盘价**（对应 15:00 单次调度）
+        - 分钟模式·盘前任务（_slot_pos<0）：PTrade 09:26 市价单在 09:31 第一根完整分钟 bar
+          收盘时撮合 → 用 09:31 bar 的 **close**
+        - 分钟模式·盘中：当前槽位 bar close
         """
+        if self._daily_mode:
+            row = self.feed.daily_row(self._day_str, code)
+            return float(row["close"]) if row else None
         md = self.feed.minute_day(self._day_str)
         if md is None:
             return None
@@ -1290,12 +1253,8 @@ class BacktestEngine:
 
     def _fill_price(self, base_price: float, is_buy: bool) -> float:
         if self.fixed_slippage is not None:
-            return base_price + (
-                self.fixed_slippage / 2 if is_buy else -self.fixed_slippage / 2
-            )
-        return base_price * (
-            1 + self.slippage_ratio / 2 if is_buy else 1 - self.slippage_ratio / 2
-        )
+            return base_price + (self.fixed_slippage / 2 if is_buy else -self.fixed_slippage / 2)
+        return base_price * (1 + self.slippage_ratio / 2 if is_buy else 1 - self.slippage_ratio / 2)
 
     def _reject(self, code: str, amount: int, reason: str) -> None:
         oid = self._next_order_id()
@@ -1320,20 +1279,20 @@ class BacktestEngine:
         if daily is None or int(daily["is_delisted"]):
             self._reject(code, amount, "退市/未上市")
             return None
-        md = self.feed.minute_day(self._day_str)
-        slot = self._slot_pos if self._slot_pos >= 0 else 0
-        if md.has_volume(code, slot) is False:
+        if not self._bar_has_volume(code):
             self._reject(code, amount, "盘中无成交（停牌或零成交）")
             return None
         # 一字板拒单（仅 LIMITED 模式；set_limit_mode("UNLIMITED") 不限制）
-        pct = _limit_pct(daily["is_st"], code, self._day_str)
-        up = _limit_price(daily["pre_close"], pct)
-        down = _limit_price(daily["pre_close"], -pct)
-        r = md.row_of(code, slot)
+        pct = limit_pct(daily["is_st"], code, self._day_str)
+        up = limit_price(daily["preclose"], pct)
+        down = limit_price(daily["preclose"], -pct)
+        bar = self._bar_now(code)
+        # 一字板 = 全天最高=最低（无波动）
         if (
             self._limit_mode != "UNLIMITED"
-            and md.high[r] == md.low[r]
-            and (md.close[r] >= up or md.close[r] <= down)
+            and bar is not None
+            and float(bar[1]) == float(bar[2])
+            and (float(bar[3]) >= up or float(bar[3]) <= down)
         ):
             self._reject(code, amount, "一字涨跌停无法成交")
             return None
@@ -1375,9 +1334,7 @@ class BacktestEngine:
                 self.portfolio.positions[code] = pos
             new_total = pos.total_amount + amt
             pos.avg_cost = (
-                (pos.avg_cost * pos.total_amount + turnover) / new_total
-                if new_total
-                else 0.0
+                (pos.avg_cost * pos.total_amount + turnover) / new_total if new_total else 0.0
             )
             pos.total_amount = new_total
             pos.today_amount += amt  # T+1：今仓不可卖
@@ -1410,6 +1367,10 @@ class BacktestEngine:
             return oid
 
         # 卖出
+        # 显式判空（虽然 closeable==0 已隐含无持仓，但显式更清晰且利于类型收窄）
+        if pos is None:
+            self._reject(code, amount, "无持仓可卖")
+            return None
         want = -amount
         if closeable <= 0:
             self._reject(code, amount, "T+1 约束：无可卖数量（当日买入不可卖）")
@@ -1501,6 +1462,14 @@ class BacktestEngine:
                 logger.error(f"on_order_response 异常：{exc}")
 
     # ---------- 行情 API ----------
+    #
+    # ⚠️ **pandas 边界**：以下 `_get_history` / `_get_price` / `_to_struct` /
+    # `_assemble_daily` / `_apply_fq_daily` / `_history_1m` / `_resample_1m`
+    # 是本项目**唯一**保留 pandas 的地方，因为 PTrade 官方规定
+    # `get_history` / `get_price` 返回 pandas 的 DataFrame / Series，
+    # 而策略普遍按 pandas 用法编写（`.reset_index()`、`.set_index()`、
+    # `.dt.strftime()`、布尔掩码索引等）。
+    # 改为 polars 会**破坏策略兼容性**，故不迁移；其余内部通路一律 polars。
     def _get_history(
         self,
         count: int,
@@ -1527,438 +1496,20 @@ class BacktestEngine:
         )
         freq = frequency.lower()
         if freq == "1d":
-            result = self._history_1d(codes, int(count), fields, fq, include, single)
+            result = self.history.daily(codes, int(count), fields, fq, include, single)
         elif freq in ("1m", "5m", "15m", "30m", "60m", "120m"):
-            result = self._history_1m(
-                codes, int(count), freq, fields, fq, include, single
-            )
+            if self._daily_mode:
+                logger.warning(
+                    f"get_history(frequency={frequency!r})：日线回测模式下无分钟数据，返回空"
+                )
+                return {} if is_dict else pd.DataFrame()
+            result = self.history.minute(codes, int(count), freq, fields, fq, include, single)
         else:
             logger.warning(f"get_history 暂不支持频率 {frequency}，返回空")
             return {} if is_dict else pd.DataFrame()
         if is_dict:
-            return {c: self._to_struct(result, c, freq) for c in codes}
+            return {c: self.history.to_struct(result, c, freq) for c in codes}
         return result
-
-    def _to_struct(self, df: pd.DataFrame, code: str, freq: str):
-        """is_dict=True 的返回：numpy 结构化数组（官方格式）。"""
-        if "code" in df.columns:
-            sub = df[df["code"] == code].drop(columns=["code"])
-        else:
-            sub = df
-        n = len(sub)
-        arr = np.zeros(
-            n,
-            dtype=[
-                ("datetime", "i8"),
-                ("open", "f8"),
-                ("high", "f8"),
-                ("low", "f8"),
-                ("close", "f8"),
-                ("volume", "f8"),
-                ("money", "f8"),
-                ("price", "f8"),
-            ],
-        )
-        if n == 0:
-            return arr
-        idx = sub.index
-        if freq == "1d":
-            arr["datetime"] = np.array([int(ts.strftime("%Y%m%d")) for ts in idx])
-        else:
-            arr["datetime"] = np.array([int(ts.strftime("%Y%m%d%H%M")) for ts in idx])
-        for f in ("open", "high", "low", "close"):
-            if f in sub.columns:
-                arr[f] = sub[f].to_numpy()
-        if "volume" in sub.columns:
-            arr["volume"] = sub["volume"].to_numpy()
-        if "money" in sub.columns:
-            arr["money"] = sub["money"].to_numpy()
-        arr["price"] = arr["close"]
-        return arr
-
-    def _history_1d(
-        self,
-        codes: list[str],
-        count: int,
-        fields: list[str],
-        fq: str | None,
-        include: bool,
-        single: bool,
-    ) -> pd.DataFrame:
-        """日线历史：默认不含当日；include=True 时当日用分钟数据合成（无未来数据）。
-        官方语义：仅入参为 str 时按单股票返回（index=fields）；list 即使只有一只也按多股票返回（[code, field]）。"""
-        days = self.feed.trade_days
-        cur_i = self.feed.day_index(self._day_str)
-        end_i = cur_i + 1 if include else cur_i
-        sel_days = days[max(0, end_i - count) : end_i]
-        records = []
-        last_close: dict[str, float] = {}
-        for ds in sel_days:
-            rows = self.feed.daily_rows(ds)
-            for code in codes:
-                if ds == self._day_str and include:
-                    # 当日：从分钟数据合成到当前槽位（避免日线全量数据的未来函数）
-                    rec = self._today_partial_row(code)
-                    if rec is not None:
-                        records.append(rec)
-                        last_close[code] = rec[5]
-                        continue
-                row = rows.get(code) if rows else None
-                if row is not None:
-                    last_close[code] = float(row["close"])
-                    records.append(
-                        (
-                            ds,
-                            code,
-                            float(row["open"]),
-                            float(row["high"]),
-                            float(row["low"]),
-                            float(row["close"]),
-                            float(row["vol"]),
-                            float(row["amount"]),
-                            float(row["pre_close"]),
-                        )
-                    )
-                else:  # 停牌：前收盘填充，量 0
-                    pc = last_close.get(code, float("nan"))
-                    records.append((ds, code, pc, pc, pc, pc, 0.0, 0.0, pc))
-        return self._assemble_daily(records, codes, fields, fq, single)
-
-    def _today_partial_row(self, code: str) -> tuple | None:
-        """当日到当前槽位的分钟合成 OHLC（include=True 时替代日线全量，防未来函数）。"""
-        md = self.feed.minute_day(self._day_str)
-        daily = self.feed.daily_row(self._day_str, code)
-        pre_close = float(daily["pre_close"]) if daily else float("nan")
-        if md is None:
-            return None
-        s = md.rows_upto(code, self._slot_pos, include=True)
-        if s.stop - s.start == 0:
-            return (
-                self._day_str,
-                code,
-                pre_close,
-                pre_close,
-                pre_close,
-                pre_close,
-                0.0,
-                0.0,
-                pre_close,
-            )
-        o = md.open[s]
-        h = float(np.max(md.high[s]))
-        low_v = float(np.min(md.low[s]))
-        c = float(md.close[s.stop - 1])
-        v = float(np.sum(md.vol[s]))
-        a = float(np.sum(md.amount[s]))
-        return (self._day_str, code, float(o), h, low_v, c, v, a, pre_close)
-
-    def _assemble_daily(
-        self, records, codes: list[str], fields: list[str], fq: str | None, single: bool
-    ) -> pd.DataFrame:
-        """长表记录 -> 官方返回格式。单股票(str入参)：index=时间(名'index'), columns=fields；
-        多股票(list入参，即使只含一只)：columns=[code, field]。"""
-        df = pd.DataFrame(
-            records,
-            columns=[
-                "day",
-                "code",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "money",
-                "pre_close",
-            ],
-        )
-        df["price"] = df["close"]
-        df["is_open"] = (df["volume"] > 0).astype(int)
-        # 价格统一 round 到 2 位（分精度）：消除 float32 存储噪声，
-        # 避免 14.9499998 < 14.95 这类误判（PTrade 行情价为精确 2 位小数）
-        for col in ("open", "high", "low", "close", "pre_close"):
-            df[col] = df[col].round(2)
-        df["price"] = df["close"]
-        # 涨停/跌停价：ST ±5%，非 ST ±10%，Decimal 四舍五入（交易所规则）
-        # 批量取 is_st（缓存 dict，一次构建，避免逐行 daily_row / Series.items 迭代）
-        st_map: dict[str, int] = {}
-        for ds in df["day"].unique():
-            st_map.update(self.feed.is_st_map(ds))
-        st = [st_map.get(code, 0) for code in df["code"]]
-        df["high_limit"] = [_limit_price(pc, _limit_pct(s, c, d)) for pc, s, c, d in zip(df["pre_close"], st, df["code"], df["day"])]
-        df["low_limit"] = [_limit_price(pc, -_limit_pct(s, c, d)) for pc, s, c, d in zip(df["pre_close"], st, df["code"], df["day"])]
-        df["unlimited"] = 0
-        if fq in ("pre", "dypre", "post"):
-            df = self._apply_fq_daily(df, codes, fq)
-        want = [f for f in fields if f in df.columns]
-        df = df[["day", "code"] + want]
-        df.index = pd.Index(pd.to_datetime(df["day"], format="%Y%m%d"), name="index")
-        if single:
-            return df[want]
-        return df[["code"] + want]
-
-    def _apply_fq_daily(
-        self, df: pd.DataFrame, codes: list[str], fq: str
-    ) -> pd.DataFrame:
-        """复权：pre/dypre 以当前回测日因子为基准，post 乘以当日因子。"""
-        base_factor = {}
-        for code in codes:
-            f = self.feed.adj_factor(self._day_str, code)
-            base_factor[code] = f if f else 1.0
-        factors = []
-        for ds, code in zip(df["day"], df["code"]):
-            f = self.feed.adj_factor(ds, code)
-            factors.append(f if f else 1.0)
-        f = np.array(factors)
-        if fq in ("pre", "dypre"):
-            base = np.array([base_factor.get(c, 1.0) for c in df["code"]])
-            ratio = f / base
-        else:  # post
-            ratio = f
-        df = df.copy()
-        for col in ("open", "high", "low", "close", "pre_close"):
-            if col in df.columns:
-                df[col] = df[col] * ratio
-        return df
-
-    def _history_1m(
-        self,
-        codes: list[str],
-        count: int,
-        freq: str,
-        fields: list[str],
-        fq: str | None,
-        include: bool,
-        single: bool,
-    ) -> pd.DataFrame:
-        """分钟历史：从当前槽位向前取 count 根（跨日），官方停牌填充语义。
-        单股票(str入参)：index=时间(名'index'), columns=fields；多股票(list入参，即使只含一只)：columns=[code, field]。"""
-        days = self.feed.trade_days
-        cur_day_i = self.feed.day_index(self._day_str)
-        # 时间轴：(day, slot)，从当前槽位向前（include=False 不含当前槽）
-        axis: list[tuple[str, int]] = []
-        start_slot = self._slot_pos + (1 if include else 0) - 1
-        d_i = cur_day_i
-        while len(axis) < count and d_i >= 0:
-            k = start_slot
-            while k >= 0 and len(axis) < count:
-                axis.append((days[d_i], k))
-                k -= 1
-            d_i -= 1
-            start_slot = len(DAY_SLOTS) - 1
-        axis.reverse()
-        records = []
-        last_close: dict[str, float] = {c: float("nan") for c in codes}
-        for ds, slot in axis:
-            md = self.feed.minute_day(ds)
-            ts = f"{ds[:4]}-{ds[4:6]}-{ds[6:]} {DAY_SLOTS[slot]}:00"
-            for code in codes:
-                r = md.row_of(code, slot) if md else -1
-                if r >= 0:
-                    o, h, low_v, c = md.open[r], md.high[r], md.low[r], md.close[r]
-                    v, a = md.vol[r], md.amount[r]
-                    last_close[code] = float(c)
-                else:  # 停牌填充：前收盘价，量 0
-                    o = h = low_v = c = last_close.get(code, float("nan"))
-                    v = a = 0.0
-                records.append(
-                    (
-                        ts,
-                        code,
-                        float(o),
-                        float(h),
-                        float(low_v),
-                        float(c),
-                        float(v),
-                        float(a),
-                    )
-                )
-        df = pd.DataFrame(
-            records,
-            columns=["ts", "code", "open", "high", "low", "close", "volume", "money"],
-        )
-        # 价格统一 round 到 2 位（分精度），消除 float32 噪声比较误判
-        for col in ("open", "high", "low", "close"):
-            df[col] = df[col].round(2)
-        df["price"] = df["close"]
-        # 复权先于重采样（按日关联因子）
-        if fq in ("pre", "dypre", "post"):
-            df["day"] = df["ts"].str[:10].str.replace("-", "")
-            df = self._apply_fq_daily(df, codes, fq)
-        if freq != "1m":
-            df = self._resample_1m(df, freq)
-        df.index = pd.Index(pd.to_datetime(df["ts"]), name="index")
-        df = df.drop(columns=["ts"])
-        want = [f for f in fields if f in df.columns]
-        if single:
-            return df[want]
-        return df[["code"] + want]
-
-    def _resample_1m(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
-        """N 分钟重采样（label/closed=right，与结束时间标注语义一致）。"""
-        n = int(freq[:-2])
-        g = df.set_index(pd.to_datetime(df["ts"])).groupby("code")
-        agg = (
-            g.resample(f"{n}min", label="right", closed="right")
-            .agg(
-                open=("open", "first"),
-                high=("high", "max"),
-                low=("low", "min"),
-                close=("close", "last"),
-                volume=("volume", "sum"),
-                money=("money", "sum"),
-            )
-            .dropna(subset=["open"])
-            .reset_index()
-        )
-        agg["price"] = agg["close"]
-        return agg.rename(columns={"time": "ts"})
-
-    def _get_price(
-        self, security, start_date, end_date, frequency, fields, fq, count, is_dict
-    ) -> pd.DataFrame | dict:
-        single = isinstance(security, str)
-        codes = [
-            to_ptrade_code(s)
-            for s in (security if isinstance(security, (list, tuple)) else [security])
-        ]
-        freq = frequency.lower()
-        if fields:
-            pass
-        elif freq == "1d":
-            # 日线默认输出含涨跌停价（现有策略依赖 high_limit）
-            fields = [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "money",
-                "price",
-                "preclose",
-                "high_limit",
-                "low_limit",
-            ]
-        else:
-            fields = ["open", "high", "low", "close", "volume", "money", "price"]
-        if isinstance(fields, str):
-            fields = [fields]
-        if freq == "1d":
-            # start_date 与 count 二选一；官方"返回内容不包括当天数据"：
-            # end_date 上限 = 上一交易日（显式传当天也会被截断到昨天，避免未来函数）
-            days = self.feed.trade_days
-            end = (
-                self._norm_day(end_date)
-                if end_date
-                else (self.feed.prev_day(self._day_str) or self._day_str)
-            )
-            limit = self.feed.prev_day(self._day_str) or self._day_str
-            if end > limit:
-                end = limit
-            if start_date and count:
-                logger.warning("get_price：start_date 与 count 只能二选一，忽略 count")
-                count = None
-            if start_date:
-                sel = self.feed.days_between(self._norm_day(start_date), end)
-            else:
-                c = int(count or 1)
-                i = bisect_right(days, end)
-                sel = days[max(0, i - c) : i]
-            records = []
-            last_close = {}
-            for ds in sel:
-                rows = self.feed.daily_rows(ds)
-                for code in codes:
-                    row = rows.get(code) if rows else None
-                    if row is not None:
-                        last_close[code] = float(row["close"])
-                        records.append(
-                            (
-                                ds,
-                                code,
-                                float(row["open"]),
-                                float(row["high"]),
-                                float(row["low"]),
-                                float(row["close"]),
-                                float(row["vol"]),
-                                float(row["amount"]),
-                                float(row["pre_close"]),
-                            )
-                        )
-                    else:
-                        pc = last_close.get(code, float("nan"))
-                        records.append((ds, code, pc, pc, pc, pc, 0.0, 0.0, pc))
-            result = self._assemble_daily(records, codes, fields, fq, single)
-            # 全市场日线批缓存：同一 (回测日, 区间, 股票集, 字段) 的重复调用直接命中。
-            # key 含 codes 原顺序（策略可能依赖候选顺序），命中返回副本避免污染。
-            if not single and len(codes) > 500:
-                ck = (
-                    self._day_str,
-                    tuple(sel),
-                    tuple(codes),
-                    tuple(fields),
-                    fq,
-                )
-                hit = self._get_price_cache.get(ck)
-                if hit is None:
-                    # 存副本：缓存对象必须与返回对象隔离（策略可能 in-place 修改返回值）
-                    self._get_price_cache[ck] = result.copy()
-                else:
-                    result = hit.copy()
-        else:
-            # 分钟频率：count 相对当前时刻向前
-            result = self._history_1m(
-                codes,
-                int(count or 1),
-                freq if freq.endswith("m") else "1m",
-                fields,
-                fq,
-                include=False,
-                single=single,
-            )
-            # _history_1m 以当前槽位为基准；get_price 不含当前，符合官方
-        if is_dict:
-            return {c: self._to_struct(result, c, freq) for c in codes}
-        return result
-
-    def _get_trade_days(self, start_date, end_date, count) -> np.ndarray:
-        days = self.feed.trade_days
-        if start_date and count:
-            logger.warning("get_trade_days：start_date 与 count 二选一，忽略 count")
-            count = None
-        end = self._norm_day(end_date) if end_date else self._day_str
-        if start_date:
-            sel = self.feed.days_between(self._norm_day(start_date), end)
-        else:
-            c = int(count or 1)
-            i = bisect_right(days, end)
-            sel = days[max(0, i - c) : i]
-        return np.array([f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in sel])
-
-    def _get_trend_data(self, stocks) -> dict:
-        """集中竞价数据：优先取 L2 竞价表（9:25 正式撮合的纯竞价量/价，精确）；
-        无记录时回退 09:30 bar（hq_px=open, business_amount=vol 近似）。"""
-        md = self.feed.minute_day(self._day_str)
-        out = {}
-        for code in stocks:
-            code = to_ptrade_code(code)
-            snap = self.feed.l2_auction.get((self._day_str, code))
-            if snap is not None:
-                out[code] = {
-                    "hq_px": snap[0],
-                    "business_amount": snap[1],
-                    "money": snap[1] * snap[0],
-                }
-                continue
-            if md is None:
-                continue
-            r = md.row_of(code, 0)
-            if r >= 0:
-                out[code] = {
-                    "hq_px": float(md.open[r]),
-                    "business_amount": float(md.vol[r]),
-                    "money": float(md.amount[r]),
-                }
-        return out
 
     def _get_snapshot(self, code: str | None) -> dict:
         bar = self._bar_now(code) if code else None
@@ -1979,23 +1530,19 @@ class BacktestEngine:
     def _pre_day_process(self) -> None:
         pf = self.portfolio
         # 1) 持仓除权处理
+        prev_ds = self.feed.prev_day(self._day_str)
         for code in list(pf.positions):
             pos = pf.positions[code]
             f_today = self.feed.adj_factor(self._day_str, code)
-            f_prev = (
-                self.feed.adj_factor(self.feed.prev_day(self._day_str), code)
-                if self.feed.prev_day(self._day_str)
-                else None
-            )
+            f_prev = self.feed.adj_factor(prev_ds, code) if prev_ds else None
             if f_today and f_prev and not math.isclose(f_today, f_prev, rel_tol=1e-9):
                 ratio = f_today / f_prev
                 new_amount = round(pos.total_amount * ratio)
                 # 现金分红：昨收 × ratio - 今日 pre_close（反推每股分红）
-                prev_ds = self.feed.prev_day(self._day_str)
                 y_close = self.feed.daily_close(prev_ds, code) if prev_ds else None
                 today_row = self.feed.daily_row(self._day_str, code)
                 if y_close and today_row:
-                    dividend = y_close * ratio - float(today_row["pre_close"])
+                    dividend = y_close * ratio - float(today_row["preclose"])
                     if dividend > 0:
                         pf._cash += new_amount * dividend
                         logger.info(
@@ -2012,9 +1559,16 @@ class BacktestEngine:
     def _run_day(self, ds: str) -> None:
         self._day_str = ds
         self._slot_pos = -1
-        # 每日重置证券信息缓存（缓存仅当日有效）
+        # 每日重置「仅当日有效」的缓存。
+        #
+        # ``history._price_cache`` 必须一起清：它的 key 含 ``clock.day``，
+        # 所以**跨日命中在构造上就不可能** —— 实际作用仅是「同一日内重复调用去重」。
+        # 既然如此，清理**不损失任何命中率**；而不清则每天新增、永不释放
+        # （全市场 ``get_price`` 单条目约 0.3~4.6 MB，长区间可累积数 GB，
+        #  且完全绕过 ``cache.py`` 的 LRU / 容量管理）。
         self._name_cache.clear()
         self._info_cache.clear()
+        self.history._price_cache.clear()
         day_dt = datetime.strptime(ds, "%Y%m%d")
         self.context.previous_date = None
         prev = self.feed.prev_day(ds)
@@ -2041,30 +1595,46 @@ class BacktestEngine:
             hh, mm = map(int, t.split(":"))
             self.blotter.current_dt = day_dt.replace(hour=hh, minute=mm)
             for fn in fns:
-                self._call_strategy(
-                    f"run_daily[{t}]{fn.__name__}", lambda fn=fn: fn(self.context)
-                )
+                self._call_strategy(f"run_daily[{t}]{fn.__name__}", lambda fn=fn: fn(self.context))
 
-        # 分钟循环：241 槽
-        for slot in range(len(DAY_SLOTS)):
-            self._slot_pos = slot
-            hh, mm = map(int, DAY_SLOTS[slot].split(":"))
-            self.blotter.current_dt = day_dt.replace(hour=hh, minute=mm)
-            # 该时点调度任务
-            for fn in self.schedule.get(DAY_SLOTS[slot], []):
-                self._call_strategy(
-                    f"run_daily[{DAY_SLOTS[slot]}]{fn.__name__}",
-                    lambda fn=fn: fn(self.context),
-                )
-            # handle_data
+        if self._daily_mode:
+            # 日线模式：官方规定「日线级别策略每天执行一次，回测在 15:00 执行」，
+            # 且 run_daily 无论设定值是多少都只在 15:00 触发。
+            self.blotter.current_dt = day_dt.replace(hour=15, minute=0)
+            self._slot_pos = -1  # 日线模式无分钟槽位
+            for t, fns in sorted(self.schedule.items(), key=lambda x: x[0]):
+                if t < "09:30":
+                    continue  # 已作为盘前任务执行过
+                for fn in fns:
+                    self._call_strategy(
+                        f"run_daily[{t}]{fn.__name__}", lambda fn=fn: fn(self.context)
+                    )
             self._call_strategy("handle_data", self._call_handle_data)
-            # 用当前 bar close 刷新持仓市值
-            md = self.feed.minute_day(ds)
-            if md:
-                for code, pos in self.portfolio.positions.items():
-                    r = md.row_of(code, slot)
-                    if r >= 0:
-                        pos.price = float(md.close[r])
+            for code, pos in self.portfolio.positions.items():
+                c = self.feed.daily_close(ds, code)
+                if c is not None:
+                    pos.price = c
+        else:
+            # 分钟循环：241 槽（含 09:30 集合竞价 bar）
+            for slot in range(len(DAY_SLOTS)):
+                self._slot_pos = slot
+                hh, mm = map(int, DAY_SLOTS[slot].split(":"))
+                self.blotter.current_dt = day_dt.replace(hour=hh, minute=mm)
+                # 该时点调度任务
+                for fn in self.schedule.get(DAY_SLOTS[slot], []):
+                    self._call_strategy(
+                        f"run_daily[{DAY_SLOTS[slot]}]{fn.__name__}",
+                        lambda fn=fn: fn(self.context),
+                    )
+                # handle_data
+                self._call_strategy("handle_data", self._call_handle_data)
+                # 用当前 bar close 刷新持仓市值
+                md = self.feed.minute_day(ds)
+                if md:
+                    for code, pos in self.portfolio.positions.items():
+                        r = md.row_of(code, slot)
+                        if r >= 0:
+                            pos.price = float(md.close[r])
 
         # 盘后
         self.blotter.current_dt = day_dt.replace(hour=15, minute=0)
@@ -2088,12 +1658,27 @@ class BacktestEngine:
 
     def _build_bar_data(self) -> dict:
         codes = list(dict.fromkeys(self.universe + list(self.portfolio.positions)))
-        md = self.feed.minute_day(self._day_str)
         day_dt = self.blotter.current_dt
+        md = None if self._daily_mode else self.feed.minute_day(self._day_str)
         out = {}
         for code in codes:
             bar = None
-            if md:
+            if self._daily_mode:
+                db = self._daily_bar(code)
+                if db is not None:
+                    bar = BarData(
+                        code,
+                        self.feed.stock_name(code, self._day_str) or "",
+                        day_dt,
+                        1 if db[4] > 0 else 0,
+                        db[0],
+                        db[1],
+                        db[2],
+                        db[3],
+                        db[4],
+                        db[5],
+                    )
+            elif md:
                 r = md.row_of(code, self._slot_pos)
                 if r >= 0:
                     bar = BarData(
@@ -2146,19 +1731,13 @@ class BacktestEngine:
                 pos.price = c
         bm = self.feed.benchmark_close(self.benchmark, ds) or float("nan")
         total = pf.total_value
-        prev_total = (
-            self.daily_stats[-1]["total_value"]
-            if self.daily_stats
-            else self.capital_base
-        )
+        prev_total = self.daily_stats[-1]["total_value"] if self.daily_stats else self.capital_base
         cum = total / self.capital_base - 1
-        peak = max(
-            [s["total_value"] for s in self.daily_stats], default=self.capital_base
-        )
+        peak = max([s["total_value"] for s in self.daily_stats], default=self.capital_base)
         peak = max(peak, total)
         self.daily_stats.append(
             {
-                "date": f"{ds[:4]}-{ds[4:6]}-{ds[6:]}",
+                "date": day_iso(ds),
                 "total_value": total,
                 "cash": pf.cash,
                 "positions_value": pf.positions_value,
@@ -2166,45 +1745,67 @@ class BacktestEngine:
                 "daily_return": total / prev_total - 1,
                 "cum_return": cum,
                 "drawdown": total / peak - 1,
-                "trades_count": sum(
-                    1 for t in self.trades if t.time.date() == day_dt_date(ds)
-                ),
+                "trades_count": sum(1 for t in self.trades if t.time.date() == day_dt_date(ds)),
                 "commission": sum(
-                    t.commission
-                    for t in self.trades
-                    if t.time.date() == day_dt_date(ds)
+                    t.commission for t in self.trades if t.time.date() == day_dt_date(ds)
                 ),
             }
         )
 
     # ---------- 主入口 ----------
-    def run(self) -> pd.DataFrame:
+    def run(self) -> pl.DataFrame:
+        """执行回测，返回逐日统计（**polars**）。"""
         t0 = datetime.now()
+        self._write_progress(phase="preload")
         if self.feed.preload_mode == "all":
             self.feed.preload()
+        elif self._daily_mode:
+            # 日线模式只需日线/估值，无需分钟数据：跳过分钟预热（省时省内存）
+            logger.info("日线回测模式：跳过分钟数据预热（仅按需读日线/估值）")
         logger.info(
             f"回测区间：{self.config['start_date']} ~ {self.config['end_date']}，"
-            f"初始资金 {self.capital_base:,.0f}，基准 {self.benchmark}"
+            f"周期 {self.frequency}，初始资金 {self.capital_base:,.0f}，基准 {self.benchmark}"
         )
+        self._write_progress(phase="init")
         self.load_strategy()
+        # 保存策略源码副本到 run 目录（策略文件日后被删/改名也能在详情页看源码）
+        self._save_strategy_source()
+        self._write_progress(phase="simulate")
         self.portfolio.start_date = self.config["start_date"]
-        for ds in self.feed.range_days:
+        for i, ds in enumerate(self.feed.range_days, start=1):
             self._run_day(ds)
+            # 每日落盘：进度 + 当日快照（供运行中看板实时读取）
+            self._write_progress(day_done=i, current_date=ds)
+            try:
+                _atomic_write_text(
+                    self.output_dir / "daily_stats.csv",
+                    frame_to_csv_text(self.daily_stats_frame()),
+                )
+            except Exception as exc:
+                logger.warning(f"daily_stats.csv 快照写入失败：{exc}")
+        self._write_progress(status="done", phase="done", day_done=len(self.feed.range_days))
         logger.info(
             f"回测完成，耗时 {(datetime.now() - t0).total_seconds():.1f}s，"
             f"期末资产 {self.portfolio.total_value:,.2f}"
         )
         return self.daily_stats_frame()
 
-    def daily_stats_frame(self) -> pd.DataFrame:
-        return pd.DataFrame(self.daily_stats)
+    def daily_stats_frame(self) -> pl.DataFrame:
+        """逐日统计（**polars**）。"""
+        return pl.DataFrame(self.daily_stats) if self.daily_stats else pl.DataFrame()
 
-    def trades_frame(self) -> pd.DataFrame:
-        return pd.DataFrame([t.__dict__ for t in self.trades])
+    def trades_frame(self) -> pl.DataFrame:
+        """成交明细（**polars**）。"""
+        return pl.DataFrame([t.__dict__ for t in self.trades]) if self.trades else pl.DataFrame()
 
 
-def day_dt_date(ds: str) -> date:
-    return date(int(ds[:4]), int(ds[4:6]), int(ds[6:]))
+def frame_to_csv_text(df: pl.DataFrame) -> str:
+    """polars DataFrame -> CSV 文本，带 UTF-8 BOM。
+
+    保留 BOM 是有意的：CSV 常被 Excel 打开，无 BOM 时中文会乱码
+    （原 pandas 实现用 ``encoding="utf-8-sig"``，行为保持一致）。
+    """
+    return "\ufeff" + df.write_csv() if df is not None and df.height else "\ufeff"
 
 
 # ============================================================
@@ -2212,81 +1813,162 @@ def day_dt_date(ds: str) -> date:
 # ============================================================
 
 
+def _excess_kurtosis(x: np.ndarray) -> float:
+    """无偏超额峰度 —— 与 ``pandas.Series.kurt()`` 逐位一致。
+
+    **为什么需要自己实现**：polars 有 ``skew()`` 但**没有** ``kurt()``，
+    而本项目原先用 pandas。polars 迁移时只换了数据类型、没换方法名，
+    于是 ``mr.kurt()`` 在 ``pl.Series`` 上抛 AttributeError。
+
+    **触发条件很容易被漏测**：那行有 ``len(mr) > 3`` 守卫，
+    只有**回测跨度超过 3 个月**才会执行 —— 8 天区间的回归永远绕过它。
+    而它是 ``compute_metrics`` 的最后一步，异常会让整个 run 死掉、
+    不产出 ``summary.json``（看板里显示为「数据缺失」）。
+
+    实测与 pandas 在**所有非退化样本上逐位一致**（Δ ≈ 1e-15）。
+    唯一差异是 ``n < 4``：pandas 返回 NaN，这里返回 ``0.0``
+    —— 沿用原有约定，避免 NaN 渗进 ``summary.json``。
+
+    公式与 ``scipy.stats.kurtosis(bias=False)`` 一致（pandas 用的就是它）::
+
+        g2 = m4 / m2**2 - 3                 # 有偏超额峰度
+        G2 = ((n+1)*g2 + 6) * (n-1) / ((n-2)*(n-3))
+    """
+    n = x.size
+    if n < 4:
+        return 0.0
+    d = x - x.mean()
+    m2 = float((d**2).mean())
+    # 「无变化」判定用**相对尺度**而非 `m2 == 0`：常量数组的残差是浮点噪声
+    # （如 np.full(10, 0.02) 的 x-mean ~ 1e-18，m2 ~ 1e-36 ≠ 0），
+    # 精确比较拦不住，会算出无意义的峰度。pandas 对常量同样返回 0.0，故一致。
+    scale = float(np.max(np.abs(x)))
+    if scale == 0.0 or m2 <= (scale * 1e-8) ** 2:
+        return 0.0
+    g2 = float((d**4).mean()) / m2**2 - 3.0
+    return float(((n + 1) * g2 + 6.0) * (n - 1) / ((n - 2) * (n - 3)))
+
+
 def compute_metrics(
-    daily: pd.DataFrame, trades: pd.DataFrame, capital_base: float, config: dict
+    daily: pl.DataFrame, trades: pl.DataFrame, capital_base: float, config: dict
 ) -> dict:
-    """计算 11 项核心指标 + 年度/月度收益分布。"""
+    """计算 11 项核心指标 + 年度/月度收益分布（全程 polars）。
+
+    入参为空表或缺关键列时返回零值摘要 —— 该函数被看板服务直接调用，
+    不能因为「回测刚开始、daily_stats.csv 还是空的」就抛异常。
+    """
+    empty = (
+        daily is None
+        or daily.height == 0
+        or not {"total_value", "daily_return", "drawdown"} <= set(daily.columns)
+    )
+    if empty:
+        return {
+            "total_return": 0.0,
+            "annual_return": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+            "calmar": 0.0,
+            "win_rate": 0.0,
+            "profit_loss_ratio": 0.0,
+            "final_value": float(capital_base),
+            "benchmark_return": float("nan"),
+            "trade_count": 0,
+            "total_commission": 0.0,
+            "annual_returns": {},
+            "monthly_returns": {},
+            "monthly_stats": {
+                "win_rate": 0.0,
+                "best_month": None,
+                "worst_month": None,
+                "mean": 0.0,
+                "median": 0.0,
+                "std": 0.0,
+            },
+            "config": {k: v for k, v in (config or {}).items() if k != "preload"},
+            "trade_days": 0,
+        }
+    if trades is None:
+        trades = pl.DataFrame()
+
+    n_days = daily.height
     total_value = daily["total_value"]
-    n_days = len(daily)
-    final_value = float(total_value.iloc[-1]) if n_days else capital_base
+    final_value = float(total_value[-1]) if n_days else capital_base
     total_return = final_value / capital_base - 1
     annual_return = (1 + total_return) ** (252 / max(n_days, 1)) - 1 if n_days else 0.0
-    rets = daily["daily_return"].astype(float)
-    std = rets.std()
+    rets = daily["daily_return"].cast(pl.Float64)
+    std = float(rets.std()) if n_days > 1 else 0.0
     sharpe = float(rets.mean() / std * np.sqrt(252)) if std and std > 0 else 0.0
     mdd = float(daily["drawdown"].min()) if n_days else 0.0
     calmar = annual_return / abs(mdd) if mdd < 0 else 0.0
 
     # 交易统计：胜率/盈亏比按卖出笔的盈亏
-    if len(trades):
-        sells = trades[trades["side"] == "sell"]
-        wins = sells[sells["trade_pnl"] > 0]
-        losses = sells[sells["trade_pnl"] <= 0]
-        win_rate = len(wins) / len(sells) if len(sells) else 0.0
-        avg_win = float(wins["trade_pnl"].mean()) if len(wins) else 0.0
-        avg_loss = abs(float(losses["trade_pnl"].mean())) if len(losses) else 0.0
-        pl_ratio = (
-            avg_win / avg_loss if avg_loss > 0 else float("inf") if avg_win > 0 else 0.0
-        )
+    n_trades = trades.height
+    if n_trades:
+        sells = trades.filter(pl.col("side") == "sell")
+        wins = sells.filter(pl.col("trade_pnl") > 0)
+        losses = sells.filter(pl.col("trade_pnl") <= 0)
+        win_rate = wins.height / sells.height if sells.height else 0.0
+        avg_win = float(wins["trade_pnl"].mean()) if wins.height else 0.0
+        avg_loss = abs(float(losses["trade_pnl"].mean())) if losses.height else 0.0
+        pl_ratio = avg_win / avg_loss if avg_loss > 0 else float("inf") if avg_win > 0 else 0.0
         total_commission = float(trades["commission"].sum())
-        n_trades = int(len(trades))
     else:
-        win_rate, pl_ratio, total_commission, n_trades = 0.0, 0.0, 0.0, 0
+        win_rate, pl_ratio, total_commission = 0.0, 0.0, 0.0
 
-    # 基准
-    bm = daily["benchmark_close"].astype(float)
-    bm_total = (
-        float(bm.iloc[-1] / bm.iloc[0] - 1)
-        if n_days and bm.notna().all()
-        else float("nan")
-    )
+    # 基准（要求全程非空，与旧实现 notna().all() 语义一致）
+    bm = daily["benchmark_close"].cast(pl.Float64)
+    bm_ok = n_days > 0 and bm.null_count() == 0
+    bm_total = float(bm[-1] / bm[0] - 1) if bm_ok else float("nan")
 
     # 年度/月度收益
-    d = daily.copy()
-    d["date"] = pd.to_datetime(d["date"])
-    d["year"] = d["date"].dt.year
-    d["ym"] = d["date"].dt.strftime("%Y-%m")
+    # ⚠️ ``date`` 列由引擎写为 ISO ``YYYY-MM-DD``（见 ``_record_daily_stats`` ->
+    # ``_day_iso``），而下面的切分按紧凑 ``YYYYMMDD`` 取位 —— 故先去掉分隔符统一口径。
+    # 否则 ``ym6`` 会取到 ``"2025-0"``，月度键变成 ``"2025--0"``，
+    # 与看板 ``_monthly_extended`` 的 ``"YYYY-MM"`` 键对不上，月度图表与明细错位。
+    compact = pl.col("date").cast(pl.String).str.replace_all("-", "")
+    d = daily.with_columns(
+        compact.str.slice(0, 4).alias("year"),
+        compact.str.slice(0, 6).alias("ym6"),
+    )
     annual_returns: dict[str, dict] = {}
-    for y, g in d.groupby("year"):
-        bmg = g["benchmark_close"].astype(float)
+    for (y,), g in d.group_by(["year"], maintain_order=True):
+        bmg = g["benchmark_close"].cast(pl.Float64)
+        bench = float(bmg[-1] / bmg[0] - 1) if bmg.null_count() == 0 and g.height else float("nan")
+        strat = float((1 + g["daily_return"].cast(pl.Float64)).product() - 1)
         annual_returns[str(y)] = {
-            "strategy": float((1 + g["daily_return"].astype(float)).prod() - 1),
-            "benchmark": float(bmg.iloc[-1] / bmg.iloc[0] - 1)
-            if bmg.notna().all()
-            else float("nan"),
+            "strategy": strat,
+            "benchmark": bench,
+            "excess": strat - bench,
         }
-        annual_returns[str(y)]["excess"] = (
-            annual_returns[str(y)]["strategy"] - annual_returns[str(y)]["benchmark"]
-        )
     monthly_returns: dict[str, float] = {}
-    for ym, g in d.groupby("ym"):
-        monthly_returns[str(ym)] = float(
-            (1 + g["daily_return"].astype(float)).prod() - 1
+    for (ym6,), g in d.group_by(["ym6"], maintain_order=True):
+        s = str(ym6)
+        monthly_returns[f"{s[:4]}-{s[4:]}"] = float(
+            (1 + g["daily_return"].cast(pl.Float64)).product() - 1
         )
-    mr = pd.Series(monthly_returns)
+    # 注意：polars 的 arg_max/arg_min 返回**位置索引**，而 pandas 的 idxmax/idxmin
+    # 返回标签，故这里需要把位置映射回月份字符串。
+    months = list(monthly_returns.keys())
+    mr = pl.Series("r", list(monthly_returns.values()), dtype=pl.Float64)
     monthly_stats = {
-        "win_rate": float((mr > 0).mean()) if len(mr) else 0.0,
-        "best_month": {"month": mr.idxmax(), "return": float(mr.max())}
-        if len(mr)
-        else None,
-        "worst_month": {"month": mr.idxmin(), "return": float(mr.min())}
-        if len(mr)
-        else None,
-        "mean": float(mr.mean()) if len(mr) else 0.0,
-        "median": float(mr.median()) if len(mr) else 0.0,
-        "std": float(mr.std()) if len(mr) else 0.0,
-        "skew": float(mr.skew()) if len(mr) > 2 else 0.0,
-        "kurt": float(mr.kurt()) if len(mr) > 3 else 0.0,
+        "win_rate": float((mr > 0).mean()) if mr.len() else 0.0,
+        "best_month": (
+            {"month": months[mr.arg_max()], "return": float(mr.max())} if mr.len() else None
+        ),
+        "worst_month": (
+            {"month": months[mr.arg_min()], "return": float(mr.min())} if mr.len() else None
+        ),
+        "mean": float(mr.mean()) if mr.len() else 0.0,
+        "median": float(mr.median()) if mr.len() else 0.0,
+        # 样本 <2 时 polars 的 std 返回 null（pandas 返回 NaN）——必须显式兜底，
+        # 否则 float(None) 会抛 TypeError（单月回测就会触发）。
+        "std": float(mr.std()) if mr.len() > 1 else 0.0,
+        # 注意 polars 的 skew 默认 bias=True（有偏），而 pandas 是无偏 ——
+        # 必须显式 bias=False，否则数值与历史结果不一致（静默偏差）。
+        "skew": float(mr.skew(bias=False)) if mr.len() > 2 else 0.0,
+        # polars **没有** kurt()，必须自己算（见 _excess_kurtosis）。
+        "kurt": _excess_kurtosis(mr.to_numpy()) if mr.len() > 3 else 0.0,
     }
 
     return {
@@ -2307,206 +1989,3 @@ def compute_metrics(
         "config": {k: v for k, v in config.items() if k != "preload"},
         "trade_days": n_days,
     }
-
-
-def render_report(
-    summary: dict, daily: pd.DataFrame, trades: pd.DataFrame, out_path: Path
-) -> None:
-    """自包含 HTML 报告：指标卡片 + 图表（base64 内嵌）+ 明细表。"""
-    import base64
-    from io import BytesIO
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    setup_matplotlib_cn_font()
-
-    def fig_b64(fig) -> str:
-        # 性能：不用 bbox_inches='tight'（会对每个文本元素做布局度量，中文慢 10 倍+）
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=110)
-        plt.close(fig)
-        return base64.b64encode(buf.getvalue()).decode()
-
-    d = daily.copy()
-    d["date"] = pd.to_datetime(d["date"])
-    # 1) 资金曲线 vs 基准 + 回撤
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(11, 6.5), sharex=True, gridspec_kw={"height_ratios": [2.2, 1]}
-    )
-    ax1.plot(
-        d["date"],
-        d["total_value"] / d["total_value"].iloc[0] - 1,
-        label="策略",
-        color="#c0392b",
-        lw=1.6,
-    )
-    bmn = d["benchmark_close"].astype(float) / d["benchmark_close"].iloc[0] - 1
-    ax1.plot(
-        d["date"],
-        bmn,
-        label="沪深300"
-        if summary["config"].get("benchmark", "").startswith("000300")
-        else "基准",
-        color="#2c3e50",
-        lw=1.2,
-    )
-    ax1.set_title("资金曲线（累计收益率）")
-    ax1.legend()
-    ax1.grid(alpha=0.3)
-    ax2.fill_between(d["date"], d["drawdown"] * 100, 0, color="#e67e22", alpha=0.55)
-    ax2.set_title("回撤（%）")
-    ax2.grid(alpha=0.3)
-    img_main = fig_b64(fig)
-
-    # 2) 年度收益柱状图（策略 vs 基准）
-    ar = summary["annual_returns"]
-    years = list(ar.keys())
-    x = np.arange(len(years))
-    fig, ax = plt.subplots(figsize=(7, 3.6))
-    ax.bar(
-        x - 0.18,
-        [ar[y]["strategy"] * 100 for y in years],
-        width=0.36,
-        label="策略",
-        color="#c0392b",
-    )
-    ax.bar(
-        x + 0.18,
-        [ar[y]["benchmark"] * 100 for y in years],
-        width=0.36,
-        label="基准",
-        color="#2c3e50",
-    )
-    for i, y in enumerate(years):
-        ax.text(
-            i,
-            max(ar[y]["strategy"], ar[y]["benchmark"]) * 100 + 0.3,
-            f"+{ar[y]['excess'] * 100:.1f}%"
-            if ar[y]["excess"] >= 0
-            else f"{ar[y]['excess'] * 100:.1f}%",
-            ha="center",
-            fontsize=9,
-            color="#7f8c8d",
-        )
-    ax.set_xticks(x, years)
-    ax.set_title("年度收益（%，含超额标注）")
-    ax.legend()
-    ax.grid(alpha=0.3, axis="y")
-    img_annual = fig_b64(fig)
-
-    # 3) 月度收益热力图（红涨绿跌）
-    mr = pd.Series(summary["monthly_returns"])
-    if len(mr):
-        mr.index = pd.to_datetime(mr.index + "-01")
-        pv = mr.to_frame("r")
-        pv["year"] = pv.index.year
-        pv["month"] = pv.index.month
-        pv = pv.pivot_table(index="year", columns="month", values="r")
-        fig, ax = plt.subplots(figsize=(9, max(2.2, 0.5 * len(pv) + 1.2)))
-        vmax = np.nanmax(np.abs(pv.to_numpy())) or 0.01
-        im = ax.imshow(
-            pv.to_numpy() * 100,
-            cmap=matplotlib.colors.LinearSegmentedColormap.from_list(
-                "cn", ["#1a9850", "#ffffff", "#d73027"]
-            ),
-            vmin=-vmax * 100,
-            vmax=vmax * 100,
-            aspect="auto",
-        )
-        ax.set_xticks(range(12), [f"{m}月" for m in range(1, 13)])
-        ax.set_yticks(range(len(pv.index)), pv.index)
-        # 性能：中文文本度量昂贵，热力图格内数字去掉（颜色已表达数值），仅保留 colorbar
-        ax.set_title("月度收益热力图（%，红涨绿跌）")
-        fig.colorbar(im, ax=ax, shrink=0.8)
-        img_month = fig_b64(fig)
-    else:
-        img_month = ""
-
-    # 4) 月度收益分布直方图
-    fig, ax = plt.subplots(figsize=(7, 3.6))
-    vals = mr.values * 100 if len(mr) else []
-    ax.hist(
-        vals,
-        bins=min(20, max(8, len(vals) * 2)),
-        color="#2980b9",
-        alpha=0.75,
-        edgecolor="white",
-    )
-    if len(vals):
-        ax.axvline(
-            np.mean(vals), color="#c0392b", ls="--", label=f"均值 {np.mean(vals):.2f}%"
-        )
-        ax.legend()
-    ax.set_title("月度收益分布")
-    ax.grid(alpha=0.3, axis="y")
-    img_hist = fig_b64(fig)
-
-    def pct(v):
-        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
-            return "—"
-        return f"{v * 100:.2f}%"
-
-    def num(v, nd=2):
-        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
-            return "—"
-        return f"{v:,.{nd}f}"
-
-    cards = [
-        ("总收益率", pct(summary["total_return"])),
-        ("年化收益率", pct(summary["annual_return"])),
-        ("夏普率", num(summary["sharpe"])),
-        ("最大回撤", pct(summary["max_drawdown"])),
-        ("卡尔玛比率", num(summary["calmar"])),
-        ("胜率", pct(summary["win_rate"])),
-        ("盈亏比", num(summary["profit_loss_ratio"])),
-        ("期末资产", f"{summary['final_value']:,.0f}"),
-        ("基准收益率", pct(summary["benchmark_return"])),
-        ("成交笔数", f"{summary['trade_count']}"),
-        ("累计佣金", f"{summary['total_commission']:,.2f}"),
-        ("月度胜率", pct(summary["monthly_stats"]["win_rate"])),
-    ]
-    ms = summary["monthly_stats"]
-    extra = ""
-    if ms.get("best_month"):
-        extra += f"<div class='card'><div class='k'>最佳月</div><div class='v'>{ms['best_month']['month']}（{ms['best_month']['return'] * 100:.2f}%）</div></div>"
-    if ms.get("worst_month"):
-        extra += f"<div class='card'><div class='k'>最差月</div><div class='v'>{ms['worst_month']['month']}（{ms['worst_month']['return'] * 100:.2f}%）</div></div>"
-
-    trades_html = (
-        trades.to_html(index=False, classes="tbl", border=0)
-        if len(trades)
-        else "<p>无成交</p>"
-    )
-    annual_rows = "".join(
-        f"<tr><td>{y}</td><td>{ar[y]['strategy'] * 100:.2f}%</td><td>{ar[y]['benchmark'] * 100:.2f}%</td>"
-        f"<td>{ar[y]['excess'] * 100:.2f}%</td></tr>"
-        for y in years
-    )
-    html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>PTrade 回测报告 - {summary["config"].get("strategy", "")}</title><style>
-body{{font-family:'Microsoft YaHei',sans-serif;margin:24px;color:#2c3e50;background:#fafafa}}
-h1{{font-size:20px}} h2{{font-size:16px;margin-top:28px;border-left:4px solid #c0392b;padding-left:8px}}
-.cards{{display:flex;flex-wrap:wrap;gap:10px}}
-.card{{background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:10px 16px;min-width:130px}}
-.k{{font-size:12px;color:#7f8c8d}} .v{{font-size:18px;font-weight:600;margin-top:4px}}
-img{{max-width:100%;border:1px solid #eee;border-radius:6px;background:#fff}}
-.tbl{{border-collapse:collapse;font-size:12px;background:#fff}}
-.tbl th,.tbl td{{border:1px solid #e5e5e5;padding:4px 8px}}
-.tbl th{{background:#f4f6f7}}
-.meta{{font-size:12px;color:#7f8c8d}}
-</style></head><body>
-<h1>PTrade 策略回测报告：{Path(summary["config"].get("strategy", "策略")).stem}</h1>
-<div class="meta">区间 {summary["config"].get("start_date")} ~ {summary["config"].get("end_date")} ｜
-初始资金 {summary["config"].get("capital_base", 0):,.0f} ｜ 交易日 {summary["trade_days"]} 天 ｜ 基准 {summary["config"].get("benchmark")}</div>
-<h2>核心指标</h2><div class="cards">{"".join(f"<div class='card'><div class='k'>{k}</div><div class='v'>{v}</div></div>" for k, v in cards)}{extra}</div>
-<h2>资金曲线与回撤</h2><img src="data:image/png;base64,{img_main}">
-<h2>年度收益分布</h2><img src="data:image/png;base64,{img_annual}">
-<h2>月度收益分布</h2><img src="data:image/png;base64,{img_month}">
-<img src="data:image/png;base64,{img_hist}">
-<h2>年度明细</h2><table class="tbl"><tr><th>年份</th><th>策略</th><th>基准</th><th>超额</th></tr>{annual_rows}</table>
-<h2>交易明细（{len(trades)} 笔）</h2>{trades_html}
-</body></html>"""
-    out_path.write_text(html, encoding="utf-8")
-    logger.info(f"报告已生成：{out_path}")
