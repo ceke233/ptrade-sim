@@ -1,0 +1,6 @@
+# pnpm 设置（pnpm 11+ 的设置入口，替代 package.json 的 "pnpm" 字段）
+# vue-demi 需要执行 postinstall 以切换到 Vue 3；显式允许，避免安装报
+# ERR_PNPM_IGNORED_BUILDS 导致 `pnpm build` 的前置依赖检查失败。
+allowBuilds:
+  vue-demi: true
+minimumReleaseAge: 0
