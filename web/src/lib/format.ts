@@ -43,8 +43,13 @@ export function seconds(v: unknown): string {
 /** ISO 时间 -> "2026-09-05 01:51:33"（本地化） */
 export function fmtDateTime(v: string | null | undefined): string {
   if (!v) return '—'
-  const d = dayjs(v)
-  return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : v
+  // 引擎写出的成交时间戳带**6 位小数秒**（`2021-01-05T14:50:00.000000`），
+  // 而 ECMAScript 的日期字符串格式只允许 3 位 —— 多出来的位数能否解析
+  // 取决于各引擎的宽松程度（V8 接受，别的不一定）。显示只到秒，
+  // 直接去掉小数部分：既无损，也不依赖引擎的宽容。
+  const s = String(v).replace(/\.\d+/, '')
+  const d = dayjs(s)
+  return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : String(v)
 }
 
 /** 策略文件基名（兼容 / 与 \\ 分隔） */

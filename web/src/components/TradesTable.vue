@@ -14,6 +14,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { ChevronLeft, ChevronRight, Loader2 } from '@lucide/vue'
+import { fmtDateTime } from '@/lib/format'
 
 const props = defineProps<{ name: string }>()
 
@@ -128,7 +129,7 @@ onMounted(load)
           </TableHeader>
           <TableBody>
             <TableRow v-for="(r, i) in pageRows" :key="String(r.order_id ?? r.time ?? i)">
-              <TableCell class="whitespace-nowrap font-mono text-xs">{{ r.time ?? '—' }}</TableCell>
+              <TableCell class="whitespace-nowrap font-mono text-xs">{{ fmtDateTime(r.time) }}</TableCell>
               <TableCell class="font-mono text-xs">{{ r.security ?? '—' }}</TableCell>
               <TableCell>
                 <template v-if="sideOf(r)">
