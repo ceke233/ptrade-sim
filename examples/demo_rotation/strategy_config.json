@@ -1,0 +1,14 @@
+{
+  "name": "示例·主板动量轮动",
+  "_comment": "策略级配置：随策略目录走。只写「这个策略怎么跑」——db_path / queue / cache 等机器级设置请留在 ptrade_config.json，换台机器不该改策略目录。",
+  "frequency": "daily",
+  "start_date": "2025-06-03",
+  "end_date": "2025-06-12",
+  "capital_base": 100000,
+  "benchmark": "000300.SS",
+  "params": {
+    "top_n": 3,
+    "watch_days": 20,
+    "rebalance_days": 5
+  }
+}

@@ -1,21 +1,52 @@
 {
-  "data_dir": "G:/data",
+  "db_path": "data/quant.duckdb",
+  "frequency": "minute",
   "start_date": "2025-01-01",
   "end_date": "2025-06-30",
   "capital_base": 100000,
   "benchmark": "000300.SS",
-  "strategy": "examples/yijin2_5x892.py",
+  "strategy": "examples/demo_rotation",
   "preload": {
     "mode": "rolling",
-    "rolling_window_days": 2,
-    "threads": 16
+    "rolling_window_days": 10,
+    "threads": 8
+  },
+  "cache": {
+    "daily_capacity": 120,
+    "feature_capacity": 120,
+    "minute_memory_budget": "auto",
+    "minute_memory_ratio": 0.25,
+    "duckdb_memory_limit": "2GB"
+  },
+  "queue": {
+    "enabled": true,
+    "max_parallel": null,
+    "cpu_slots_limit": null,
+    "poll_interval": 10,
+    "max_wait_sec": 3600,
+    "dir": null
   },
   "cost": {
     "commission_ratio": 0.0003,
     "min_commission": 5.0,
     "handling_fee_ratio": 4.87e-05,
     "stamp_tax": 0.001,
-    "slippage_ratio": 0.0,
-    "_comment": "PTrade 默认无滑点（策略未调用 set_slippage 时）；如需模拟滑点成本改此值"
+    "slippage_ratio": 0.0
+  },
+  "_comments": {
+    "db_path": "DuckDB 物理库路径（引擎唯一数据源）；用 ptrade-sim db build 构建",
+    "strategy": "策略**目录**（推荐：内含 strategy.py + strategy_config.json），也兼容单个 .py 文件",
+    "frequency": "minute（默认，handle_data 每交易日 241 次：09:30~15:00）| daily（每天 1 次，15:00）",
+    "_分层": "优先级由低到高：本模板 ← ptrade_config.json（机器级私有）← strategy_config.json（策略级）← 环境变量 PT_SIM_* ← CLI 参数",
+    "_策略目录": "一个策略一个目录：strategy.py（代码）+ strategy_config.json（该策略的配置：回测区间/资金/基准/展示名/params）。db_path、queue、cache 等机器级设置留在本文件，换机器不必改策略目录",
+    "preload.mode": "rolling=流式（默认，按内存预算滚动，长区间内存平稳）| all=全量常驻（长区间易 OOM）",
+    "cache.minute_memory_budget": "\"auto\"（可用内存×ratio）|\"512MB\"|\"2GB\"|字节数|null=不限",
+    "cache.daily_capacity": "日线/估值缓存条数上限；null=不淘汰",
+    "cache.duckdb_memory_limit": "DuckDB 缓冲池上限，\"2GB\"|\"512MB\"|字节数。**不建议设为 null**：DuckDB 默认取系统内存的 80% 且缓冲池只增不减，而本平台每天读不同日期、几乎没有页复用，不设上限会让长区间回测累计数十 GB（实测 6 年区间 26 GB+，设 2GB 后平稳在 1.9 GB）",
+    "queue.max_parallel": "最多同时跑几个回测；null=按 cpu_count//2",
+    "queue.cpu_slots_limit": "所有回测线程数之和上限；null=按 cpu_count-1",
+    "queue.dir": "队列注册表目录；null=机器级默认 ~/.ptrade-sim/queue（跨 output-dir 协调）",
+    "queue.max_wait_sec": "排队超时（秒）；null=无限等待，0=完全不等待（等同 --no-wait）",
+    "cost._comment": "PTrade 默认无滑点（策略未调用 set_slippage 时）"
   }
 }
