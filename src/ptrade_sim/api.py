@@ -278,6 +278,23 @@ def _api_info(e) -> dict:
         return out
 
     def get_stock_info(stocks, field=None):
+        """证券基础信息（**按回测日**取时点值）。
+
+        官方签名没有日期参数，但该接口在**回测模块也可用** ——
+        所以三个字段都必须反映「回测当日」而非「今天」，否则等于把未来
+        信息泄漏给策略：
+
+        - ``stock_name``：走 ``feed.stock_name(code, 回测日)``（当日日线
+          ``name`` 优先，与 ``get_stock_name`` 完全一致）。**曾误用
+          ``stock_basic.name``** —— 那是「末尾快照」，例如某只在 2021 年
+          叫「鸿达兴业」的股票，2024 年退市后基础表里是「ST鸿达(退)」，
+          回测到 2021 年就会看到这个名字，同时泄漏「后来戴帽」与「后来退市」。
+        - ``de_listed_date``：回测日**尚未退市**时返回官方的「未退市」约定值
+          ``2900-01-01``，只有已退市才给真实日期。**曾直接回表里的退市日** ——
+          策略在 2021 年就能读到「2024-03-18 退市」，等于知道结局。
+        - ``listed_date``：上市日是静态事实，不变（回测日必然已在市，
+          否则它不会出现在股票池里）。
+        """
         codes = as_codes(stocks)
         fields = field if (field is None or isinstance(field, list)) else [field]
         out = {}
@@ -292,9 +309,16 @@ def _api_info(e) -> dict:
             if row:
                 ld = row.get("list_date")
                 dd = row.get("delist_date")
-                item["stock_name"] = None if row.get("name") is None else str(row["name"])
+                # ① 简称取**当日**生效值（与 get_stock_name 同源，避免两者不一致）
+                item["stock_name"] = e.feed.stock_name(c, e._day_str)
+                # ② 上市日：静态事实
                 item["listed_date"] = None if ld is None else day_iso(ld)
-                item["de_listed_date"] = "2900-01-01" if dd is None else day_iso(dd)
+                # ③ 退市日：只在**回测日已退市**时才给真实日期，否则按官方约定
+                #    返回「未退市」哨兵值 —— 否则就是前视泄漏
+                if dd is None or str(dd) == "" or norm_day(dd) > norm_day(e._day_str):
+                    item["de_listed_date"] = "2900-01-01"
+                else:
+                    item["de_listed_date"] = day_iso(dd)
             else:
                 item = {
                     "stock_name": None,

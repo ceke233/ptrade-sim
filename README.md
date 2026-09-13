@@ -407,6 +407,9 @@ esac
 - `get_stock_status` / `filter_stock_by_status`：`ST`/`HALT`/`DELISTING` 均按
   **指定日期**判定（`DELISTING` 只看 `delist_date`，不看「当前」状态，
   避免历史查询出现幸存者偏差）；`DELISTING_SORTING` 仅交易场景支持，返回空
+- `get_stock_info`：三个字段都按**回测当日**取值 —— `stock_name` 与
+  `get_stock_name` 同源（当日简称），`de_listed_date` 在回测日尚未退市时
+  返回 `2900-01-01`（不泄漏未来的退市日），`listed_date` 是静态的事实
 - **占位接口**（可调用、返回空值并在首次调用告警，不会 `NameError`；完整实现需补数据表）：
   `get_stock_exrights`、`get_stock_blocks`、`get_industry_stocks`、`get_reits_list`
 - **no-op 设置**：`set_volume_ratio`、`set_yesterday_position` 可调用但不改变本地回测行为
