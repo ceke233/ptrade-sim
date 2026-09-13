@@ -404,6 +404,9 @@ esac
 - `get_fundamentals`：仅支持 `valuation`（市值），其余报表返回空 DataFrame
 - `get_index_stocks`：需库内有 `ashare_index_weight`，否则返回空列表
 - `get_market_detail`：返回空 DataFrame（无盘口明细）
+- `get_stock_status` / `filter_stock_by_status`：`ST`/`HALT`/`DELISTING` 均按
+  **指定日期**判定（`DELISTING` 只看 `delist_date`，不看「当前」状态，
+  避免历史查询出现幸存者偏差）；`DELISTING_SORTING` 仅交易场景支持，返回空
 - **占位接口**（可调用、返回空值并在首次调用告警，不会 `NameError`；完整实现需补数据表）：
   `get_stock_exrights`、`get_stock_blocks`、`get_industry_stocks`、`get_reits_list`
 - **no-op 设置**：`set_volume_ratio`、`set_yesterday_position` 可调用但不改变本地回测行为

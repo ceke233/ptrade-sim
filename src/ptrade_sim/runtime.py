@@ -1197,13 +1197,22 @@ class BacktestEngine:
                 return True
             return float(md.vol[s:e_].sum()) <= 0
         if query_type == "DELISTING":
+            # 官方：本接口获取的是**指定日期**的属性 —— 故必须按时点判定。
             b = self.feed.basic_dict()
             if code not in b:
+                # 基础信息里没有这个标的：无法确认，保守视为不可用（与原行为一致）
                 return True
-            row = b[code]
-            dd = row.get("delist_date")
-            cur = day_iso(ds)
-            return (row.get("list_status") == "D") or (dd is not None and str(dd) <= cur)
+            dd = b[code].get("delist_date")
+            if dd is None or str(dd) == "":
+                return False  # 无退市日 = 未退市
+            # ⚠️ 与库内同为 YYYYMMDD 才能字符串比较。
+            # 这里曾写作 ``cur = day_iso(ds)``（YYYY-MM-DD），同年份必然判错
+            # （第 5 个字符 '0' > '-'）—— 于是「当年退市的股票查当年查不出来」。
+            # 另一半问题是 ``or row.get("list_status") == "D"``：那是「**当前**是否
+            # 退市」，用于历史查询会把「**未来才退市**」的股票也判为已退市。
+            # 实测 2020-01-02 会返回 319 只「已退市」，而当日实际只有 110 只。
+            # 策略据此提前剔除未来的输家，构成幸存者偏差。
+            return str(dd).replace("-", "") <= norm_day(ds)
         return None
 
     def _check_limit(self, code: str, query_date: str | None = None) -> int:
