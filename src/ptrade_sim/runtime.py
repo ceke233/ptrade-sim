@@ -77,9 +77,20 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 _SLOT_MINUTES = np.array(sorted(int(s[:2]) * 60 + int(s[3:]) for s in DAY_SLOTS), dtype=np.int32)
 
-# 主板 A 股代码前缀（get_Ashares 双保险用）
-_MAINBOARD_PREFIX = ("000", "001", "002", "003")  # 深主板（含原中小板）
-_MAINBOARD_PREFIX_SH = ("600", "601", "603", "605")  # 沪主板
+# 沪深 A 股的代码前缀（用于 get_Ashares 的复核）。
+#
+# 用**前两位**而不是三位：交易所是按两位号段分配的，写死三位会在新号段出现时
+# 静默漏掉股票 —— 实测就有反例：``302132.SZ``（中航成飞，创业板，在市），
+# 只写 ``300/301`` 会把它丢掉。
+#   深市：00 = 主板（含原中小板 002/003）、30 = 创业板（300/301/302）
+#   沪市：60 = 主板（600/601/603/605）、68 = 科创板（688/689）
+# 北交所（43/83/87/92 段、尾缀 .BJ）**不在其中** ——
+# 官方 ``get_Ashares`` 的语义是「沪深市场的所有A股」，既非沪也非深。
+_SZ_A_PREFIX2 = ("00", "30")
+_SS_A_PREFIX2 = ("60", "68")
+
+#: ``get_Ashares`` 纳入的板块（北交所排除，见上）
+_CN_A_MARKETS = ("主板", "创业板", "科创板")
 
 
 # ============================================================
@@ -222,6 +233,9 @@ class DataFeed:
             )
         self.trade_days: list[str] = sorted(cal["date"].to_list())  # YYYYMMDD
         self._day_pos = {d: i for i, d in enumerate(self.trade_days)}
+        #: 一次性告警去重：market 列为沪深 A 股但代码前缀不认识的标的
+        #: （脏数据，或交易所新开号段 —— 见 get_Ashares 的 docstring）
+        self._unrecognized_warned: set[str] = set()
         self.range_days: list[str] = [d for d in self.trade_days if start_day <= d <= end_day]
         if not self.range_days:
             # 日历是参考表（通常全量），区间无交易日多半是日期写错
@@ -538,7 +552,21 @@ class DataFeed:
         return None
 
     def get_Ashares(self, cur_day: str) -> list[str]:
-        """指定日主板 A 股列表（缓存）。"""
+        """指定日**沪深全部 A 股**列表（主板 + 创业板 + 科创板）。
+
+        官方语义是「获取指定日期**沪深市场的所有A股**代码列表」。
+        此前本方法只返回**主板**（硬过滤 ``market == "主板"``），
+        静默漏掉创业板/科创板约 40% 的股票 —— 于是需要全市场池的策略
+        只能绕过引擎自己去读源数据。**不含北交所**：北交所代码为
+        43/83/87/92 段且尾缀 ``.BJ``，既非沪也非深。
+
+        板块判定用两道，且**不一致时告警而非静默丢弃**：
+
+        1. ``market`` 列取沪深 A 股（排除北交所）；
+        2. 代码前缀复核。前缀不认识说明要么是脏数据（如 ``TS0018.SS`` ——
+           代码不是合法股票代码），要么是交易所开了新号段 ——
+           两种都该让人知道，而不是让股票池悄悄变小。
+        """
         ck = ("ashares", cur_day)
         v = self.cache.static.get(ck)
         if v is not MISSING:
@@ -546,7 +574,7 @@ class DataFeed:
         cur = day_iso(cur_day)
         # 全程 polars：过滤在引擎内完成，避免把 5000+ 行逐行迭代出来
         listed = self.basic.filter(
-            (pl.col("market") == "主板")
+            pl.col("market").is_in(_CN_A_MARKETS)
             & (pl.col("list_status") == "L")
             & pl.col("list_date").is_not_null()
             & pl.col("list_date").str.slice(0, 4).str.contains(r"^\d{4}$")  # 防脏数据
@@ -556,11 +584,22 @@ class DataFeed:
             listed["code"], listed["list_date"], listed["delist_date"], strict=False
         ):
             code = str(code)
-            p3 = code[:3]
-            if not (
-                (code.endswith(".SZ") and p3 in _MAINBOARD_PREFIX)
-                or (code.endswith(".SS") and p3 in _MAINBOARD_PREFIX_SH)
-            ):
+            p2 = code[:2]
+            if code.endswith(".SZ"):
+                known = p2 in _SZ_A_PREFIX2
+            elif code.endswith(".SS"):
+                known = p2 in _SS_A_PREFIX2
+            else:
+                known = False  # .BJ（北交所）等：官方语义不含
+            if not known:
+                if code not in self._unrecognized_warned:
+                    self._unrecognized_warned.add(code)
+                    logger.warning(
+                        f"get_Ashares：{code} 的 market 列为沪深 A 股，但代码前缀 "
+                        f"{p2!r} 不在已知号段（深 00/30、沪 60/68）内，已排除。"
+                        f"若这是交易所新开号段，请更新 runtime._SZ_A_PREFIX2 / "
+                        f"_SS_A_PREFIX2；若是脏数据可忽略本条。"
+                    )
                 continue
             if str(ld) > cur:
                 continue

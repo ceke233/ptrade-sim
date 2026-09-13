@@ -397,6 +397,9 @@ esac
 
 ### 受限与占位
 
+- `get_Ashares`：返回**沪深全部 A 股**（主板 + 创业板 + 科创板），
+  **不含北交所** —— 官方语义是「沪深市场」。按回测日期做时点过滤，
+  未上市/已退市的不会返回
 - `get_fundamentals`：仅支持 `valuation`（市值），其余报表返回空 DataFrame
 - `get_index_stocks`：需库内有 `ashare_index_weight`，否则返回空列表
 - `get_market_detail`：返回空 DataFrame（无盘口明细）
