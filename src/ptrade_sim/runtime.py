@@ -560,6 +560,13 @@ class DataFeed:
         只能绕过引擎自己去读源数据。**不含北交所**：北交所代码为
         43/83/87/92 段且尾缀 ``.BJ``，既非沪也非深。
 
+        **时点判定只看 ``list_date`` / ``delist_date``，不看 ``list_status``。**
+        ``list_status`` 是「**当前**是否在市」，用它过滤历史日期就是**幸存者偏差**：
+        2020 年在市、2023 年退市的股票现在状态是 ``D``，查 2020 年时会被错误排除。
+        实测被误排除的规模随回测起点变早而增大 —— 2019 年 6.1%、2020 年 5.5%、
+        2025 年 0.6%，且被排除的**全是退市股**（退市锐电、乐视退…）：
+        回测只见幸存者，会系统性高估收益。
+
         板块判定用两道，且**不一致时告警而非静默丢弃**：
 
         1. ``market`` 列取沪深 A 股（排除北交所）；
@@ -571,18 +578,26 @@ class DataFeed:
         v = self.cache.static.get(ck)
         if v is not MISSING:
             return v
-        cur = day_iso(cur_day)
-        # 全程 polars：过滤在引擎内完成，避免把 5000+ 行逐行迭代出来
+        # ⚠️ 必须与库内 list_date/delist_date **同为 YYYYMMDD** 才能字符串比较。
+        # 这里曾写作 day_iso(cur_day)（YYYY-MM-DD），与库内的 8 位串比较时
+        # 同年份必然判错：'2025-03-01' vs '20250601' 在第 5 个字符上 '0' > '-'
+        # —— 于是「当年新上市的股票被错误排除、当年退市的被错误包含」。
+        # 此前被 list_status='L' 掩盖了大部分症状。
+        cur = norm_day(cur_day)
+        # 全程 polars：过滤在引擎内完成，避免把 5000+ 行逐行迭代出来。
+        # 日期也在这里一次性归一（去掉可能的 '-'），循环内只做纯字符串比较。
+        # ⚠️ 这里**不能**按 list_status 过滤（见 docstring 的幸存者偏差说明）。
         listed = self.basic.filter(
             pl.col("market").is_in(_CN_A_MARKETS)
-            & (pl.col("list_status") == "L")
             & pl.col("list_date").is_not_null()
             & pl.col("list_date").str.slice(0, 4).str.contains(r"^\d{4}$")  # 防脏数据
-        ).select(["code", "list_date", "delist_date"])
+        ).select(
+            pl.col("code"),
+            pl.col("list_date").str.replace_all("-", "").alias("ld"),
+            pl.col("delist_date").str.replace_all("-", "").alias("dl"),
+        )
         result = []
-        for code, ld, dl in zip(
-            listed["code"], listed["list_date"], listed["delist_date"], strict=False
-        ):
+        for code, ld, dl in zip(listed["code"], listed["ld"], listed["dl"], strict=False):
             code = str(code)
             p2 = code[:2]
             if code.endswith(".SZ"):
@@ -601,9 +616,9 @@ class DataFeed:
                         f"_SS_A_PREFIX2；若是脏数据可忽略本条。"
                     )
                 continue
-            if str(ld) > cur:
+            if str(ld) > cur:  # 查询日尚未上市
                 continue
-            if dl is not None and str(dl) <= cur:
+            if dl is not None and str(dl) <= cur:  # 查询日已退市
                 continue
             result.append(code)
         result.sort()

@@ -40,17 +40,40 @@ CASES = [
     # ---- 北交所：不返回（官方语义是沪深）----
     ("920001.BJ", "北交所", "20231101", None, "L", False),
     ("430047.BJ", "北交所", "20210701", None, "L", False),
-    # ---- 时点过滤 ----
+    # ---- 时点过滤（**判据是 list_date/delist_date，不是 list_status**）----
     ("300002.SZ", "创业板", "20991231", None, "L", False),  # 查询日尚未上市
     ("300003.SZ", "创业板", "20091030", "20200601", "D", False),  # 查询日前已退市
+    # **幸存者偏差的核心用例**：2009-10-30 上市、2025-03-01 退市。
+    # 查 2025-01-02 时它仍在市，必须返回；查 2025-06-01 时已退市，必须排除。
+    # 若实现里带 list_status=='L'，它会被永久排除 —— 那正是幸存者偏差。
+    ("300004.SZ", "创业板", "20091030", "20250301", "D", "PIT"),
     # ---- 脏数据 ----
-    # 真实库里的一条（上港集箱(退)），状态 D —— 被**状态过滤**挡下，走不到前缀校验
+    # 真实库里的一条（上港集箱(退)），状态 D —— 由**退市时点**挡下，走不到前缀校验
     ("TS0018.SS", "主板", "20000719", "20061020", "D", False),
     # 在市的非法代码 —— 只有它才会走到**前缀校验**，用于验证第二道防线 + 告警
     ("TS9999.SS", "主板", "20000719", None, "L", False),
     # ---- 交易所新号段：market 说创业板，前缀不在已知集合 ----
     ("310001.SZ", "创业板", "20250101", None, "L", False),
 ]
+
+
+def expected(date: str) -> set[str]:
+    """按**时点**语义算出该查询日应返回的集合。
+
+    在市 ⟺ ``list_date <= 查询日`` 且（``delist_date`` 为空 或 ``> 查询日``）。
+    ``list_status`` **不参与**判定 —— 它是「今天」的状态，
+    用于历史查询即幸存者偏差。
+    """
+    out = set()
+    for code, _mkt, ld, dl, _st, keep in CASES:
+        if keep is False:
+            continue
+        if keep == "PIT":
+            if ld <= date and (dl is None or dl > date):
+                out.add(code)
+            continue
+        out.add(code)
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -128,8 +151,74 @@ def test_includes_all_cn_boards(feed):
     旧实现只给主板，创业板/科创板整体消失 —— 这是 40% 量级的静默缩水。
     """
     got = set(feed.get_Ashares("20250102"))
-    want = {c for c, _, _, _, _, keep in CASES if keep}
+    want = expected("20250102")
     assert got == want, f"缺失：{sorted(want - got)}\n多出：{sorted(got - want)}"
+
+
+def test_delisted_before_query_is_excluded(feed):
+    """查询日之前已退市的，不返回。"""
+    assert "300003.SZ" not in feed.get_Ashares("20250102"), "2020-06-01 已退市"
+
+
+def test_still_listed_at_query_is_included_despite_delisted_now(feed):
+    """**幸存者偏差回归**：查询日仍在市、但**今天已退市**的股票必须返回。
+
+    判据只能是 ``list_date`` / ``delist_date`` 与查询日的比较，
+    **不能**用 ``list_status``（那是「今天」的状态）。带上它就会把
+    「当年在市、后来退市」的股票永久排除 —— 回测只见幸存者，系统性高估收益。
+
+    实测真实库被误排除的规模：2019 年 6.1%、2020 年 5.5%、2025 年 0.6%，
+    且被排除的全是退市股。
+    """
+    got = feed.get_Ashares("20250102")
+    assert "300004.SZ" in got, "2025-03-01 才退市，查 2025-01-02 时仍在市 —— 被排除即为幸存者偏差"
+    # 同一个标的，换到退市后的日期就必须消失（说明是时点判定而非永久放行）
+    assert "300004.SZ" not in feed.get_Ashares("20250601"), "2025-06-01 已退市"
+
+
+def test_list_status_is_not_used_as_a_filter(feed):
+    """防回退：``list_status`` 不得出现在 polars 过滤条件里。
+
+    这条断言的价值在于**防回退** —— 只要有人把 ``list_status == 'L'`` 加回去，
+    幸存者偏差就会静默复活。
+    """
+    import inspect
+
+    from ptrade_sim import runtime
+
+    src = inspect.getsource(runtime.DataFeed.get_Ashares)
+    # 只看过滤表达式那几行（docstring 与注释里会解释为什么不看它）
+    filter_part = src[src.index("self.basic.filter") : src.index(".select(")]
+    assert "list_status" not in filter_part, (
+        "get_Ashares 的过滤条件里出现了 list_status —— 会让历史查询产生幸存者偏差"
+    )
+
+
+def test_date_comparison_uses_same_format(feed):
+    """防回退：日期比较必须在**同一格式**下进行。
+
+    这曾是一个潜伏 bug：``cur`` 由 ``day_iso()`` 得到 ``YYYY-MM-DD``，
+    而库内 ``list_date``/``delist_date`` 是 ``YYYYMMDD``。字符串比较在
+    **同年份**时必然判错（第 5 个字符 ``'0'`` > ``'-'``）：
+
+        '20250301' <= '2025-06-01'  ->  False（已退市却未排除）
+        '20250101' >  '2025-06-01'  ->  True （已上市却被排除）
+
+    于是「当年新上市的股票被错误排除、当年退市的被错误包含」。
+    夹具里的 300004.SZ 正是同年份退市（2025-03-01）的用例。
+    """
+    assert "300004.SZ" not in feed.get_Ashares("20250601"), (
+        "同年份退市的没被排除 —— 日期比较又在混用格式"
+    )
+
+
+def test_day_iso_tolerates_already_formatted_input():
+    """``day_iso`` 必须能接受已带 ``-`` 的输入（原先会输出 ``'2025--0-1-02'``）。"""
+    from ptrade_sim.conventions import day_iso, norm_day
+
+    for raw in ("20250102", "2025-01-02"):
+        assert day_iso(raw) == "2025-01-02", f"day_iso({raw!r}) 错误"
+        assert norm_day(raw) == "20250102", f"norm_day({raw!r}) 错误"
 
 
 def test_includes_chinext_302_range(feed):
@@ -157,20 +246,19 @@ def test_excludes_not_yet_listed_and_delisted(feed):
     assert "300003.SZ" not in got, "delist_date 早于查询日，不应返回"
 
 
-def test_dirty_code_is_excluded_and_warned(feed, caplog):
-    """在市的非法代码应被排除**并告警**，而不是静默丢弃。
+def test_dirty_code_is_excluded_and_warned(feed):
+    """非法代码应被排除**并告警**，而不是静默丢弃。
 
-    ``TS9999.SS`` 的 ``market`` 列写着「主板」—— 只用 market 过滤会把它当正常
-    股票放进池子；只用前缀过滤会静默丢掉。正确行为是：排除 + 告警让人知道。
-
-    注：真实库那条 ``TS0018.SS`` 状态是 D，被**状态过滤**先挡下（见
-    ``test_excludes_not_yet_listed_and_delisted``），走不到前缀校验 ——
-    所以这里另造一条在市（``L``）的非法代码来覆盖第二道防线。
+    ``TS0018.SS`` / ``TS9999.SS`` 的 ``market`` 列都写着「主板」——
+    只用 market 过滤会把它们当正常股票放进池子；只用前缀过滤会静默丢掉。
+    正确行为是：排除 + 告警让人知道。
     """
     got = feed.get_Ashares("20250102")
-    assert "TS9999.SS" not in got, "非法代码不应进入股票池"
-    assert "TS9999.SS" in feed._unrecognized_warned, (
-        "前缀不认识时没有记入告警集合 —— 静默丢弃是本项目要根治的模式"
+    for code in ("TS0018.SS", "TS9999.SS"):
+        assert code not in got, f"{code} 是非法代码，不应进入股票池"
+    assert {"TS0018.SS", "TS9999.SS"} <= feed._unrecognized_warned, (
+        f"前缀不认识时没有记入告警，实际 {sorted(feed._unrecognized_warned)} —— "
+        f"静默丢弃是本项目要根治的模式"
     )
 
 
@@ -191,15 +279,21 @@ def test_warning_is_deduplicated(feed):
     """同一标的只告警一次 —— 长回测里每天调用会刷屏。"""
     for _ in range(5):
         feed.get_Ashares("20250102")
-    assert len(feed._unrecognized_warned) == 2, (
-        f"应只记录 2 个异常标的（TS9999.SS / 310001.SZ），实际 {sorted(feed._unrecognized_warned)}"
+        feed.get_Ashares("20250601")
+    assert len(feed._unrecognized_warned) == 3, (
+        f"应只记录 3 个异常标的（TS0018.SS / TS9999.SS / 310001.SZ），实际 "
+        f"{sorted(feed._unrecognized_warned)} —— 重复调用不应重复累计"
     )
 
 
-def test_dateless_call_uses_backtest_day(feed):
-    """不传日期时用回测当日 —— 官方：默认值随回测日期变化。"""
+def test_result_changes_with_query_date(feed):
+    """不同查询日的结果应随时点变化 —— 这就是时点语义的意义。
 
-    # 直接验 feed 层：不同日期的结果可以不同（时点语义）
-    a = feed.get_Ashares("20250102")
-    b = feed.get_Ashares("20250601")
-    assert set(a) == set(b), "本夹具没有期间变动，两天应相同（前提校验）"
+    ``300004.SZ`` 于 2025-03-01 退市：查 2025-01-02 时在市（在内），
+    查 2025-06-01 时已退市（不在）。若两天结果完全相同，
+    说明时点过滤没生效 —— 那正是幸存者偏差的形态。
+    """
+    a = set(feed.get_Ashares("20250102"))
+    b = set(feed.get_Ashares("20250601"))
+    assert "300004.SZ" in a and "300004.SZ" not in b, "退市前后应不同"
+    assert a - b == {"300004.SZ"}, f"两天差异应只有退市股，实际 {a - b}"

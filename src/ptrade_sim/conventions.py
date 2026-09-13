@@ -77,8 +77,13 @@ def norm_day(d) -> str:
 
 
 def day_iso(d8) -> str:
-    """8 位日期 ``YYYYMMDD`` -> ``YYYY-MM-DD``（内部比较与展示统一用这个格式）。"""
-    s = str(d8)
+    """``YYYYMMDD`` -> ``YYYY-MM-DD``。
+
+    入参先经 :func:`norm_day` 归一，因此 ``2025-01-02`` / ``date`` / ``datetime``
+    也能正确转换。原先直接按位置切串，传入已带 ``-`` 的值会得到
+    ``'2025--0-1-02'`` 这种垃圾 —— 而它**不报错**，只会在下游比较里静默判错。
+    """
+    s = norm_day(d8)
     return f"{s[:4]}-{s[4:6]}-{s[6:]}"
 
 
