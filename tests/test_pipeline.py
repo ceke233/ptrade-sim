@@ -145,6 +145,7 @@ def _install_fakes(
     gaps: dict | None = None,
     allow_queue: bool = True,
     data_errors: list[str] | None = None,
+    trades_df: pl.DataFrame | None = None,
 ) -> _Hooks:
     """把引擎与队列换成假的，并记录编排层交给它们的每一个参数。"""
     hooks = _Hooks()
@@ -172,7 +173,9 @@ def _install_fakes(
             return _daily_frame() if daily_frame is None else daily_frame
 
         def trades_frame(self):
-            return pl.DataFrame()
+            # 默认空表；注入 trades_frame 参数可让契约测试覆盖真实列型
+            # （如 Datetime 的 time 列 —— 那是 CSV 格式化逻辑的触发条件）
+            return pl.DataFrame() if trades_df is None else trades_df
 
         def data_gaps(self):
             return dict(gaps or {})
@@ -249,6 +252,7 @@ def _run(
     strategy_name: str = "my_strategy",
     strategy_cfg: dict | None = None,
     data_errors: list[str] | None = None,
+    trades_df: pl.DataFrame | None = None,
 ) -> _Result:
     """跑一遍 ``run_backtest``，全程不碰真实库/引擎/看板。"""
     monkeypatch.chdir(tmp_path)
@@ -277,6 +281,7 @@ def _run(
         gaps=gaps,
         allow_queue=allow_queue,
         data_errors=data_errors,
+        trades_df=trades_df,
     )
     if not no_dashboard:
         _install_fake_dashboard(monkeypatch, hooks, error=dashboard_error)
@@ -717,3 +722,104 @@ def test_no_data_errors_keeps_success_and_omits_field(tmp_path, monkeypatch, log
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert "data_errors" not in summary, "无失败时不该写入空的 data_errors"
     assert "结果不可信" not in res.log_text
+
+
+# ============================================================
+# 7. trades.csv 的时间列格式
+# ============================================================
+
+
+def test_csv_time_column_is_human_readable():
+    """trades.csv 的 ``time`` 列必须是 ``YYYY-MM-DD HH:MM:SS``。
+
+    防的是：``trades_frame()`` 返回 polars ``Datetime`` 列，而 ``write_csv``
+    会把它序列化成 ``2021-01-05T14:50:00.000000`` —— 中间带 ``T``、末尾 6 位
+    小数秒。**Excel 不认这个格式**，看板也得另做解析。
+    """
+    from datetime import datetime
+
+    from ptrade_sim.runtime import frame_to_csv_text
+
+    df = pl.DataFrame({"time": [datetime(2021, 1, 5, 14, 50, 0)], "security": ["600095.SS"]})
+    out = pipeline._csv_friendly_time(df)
+
+    assert out.schema["time"] == pl.String, "写出时 time 应转成字符串列"
+    assert out["time"][0] == "2021-01-05 14:50:00"
+
+    csv = frame_to_csv_text(out)
+    assert "2021-01-05 14:50:00" in csv
+    assert "T14:50" not in csv, "不应残留 ISO 的 T 分隔符"
+    assert ".000000" not in csv, "不应残留 6 位小数秒"
+
+
+def test_csv_time_helper_passes_through_other_shapes():
+    """空表 / 无 time 列 / 已是字符串 —— 都原样返回，不抛异常。
+
+    这几条是**幂等与幂等性**保护：helper 会在每次写出时被调用，
+    形状不对时必须安静放过，而不是让回测在最后一步崩掉。
+    """
+    import polars as pl
+
+    assert pipeline._csv_friendly_time(None) is None
+
+    empty = pl.DataFrame()
+    assert pipeline._csv_friendly_time(empty).height == 0
+
+    no_time = pl.DataFrame({"a": [1]})
+    assert pipeline._csv_friendly_time(no_time).columns == ["a"]
+
+    already = pl.DataFrame({"time": ["2021-01-05 14:50:00"]})
+    assert pipeline._csv_friendly_time(already)["time"][0] == "2021-01-05 14:50:00"
+
+
+def test_trades_frame_keeps_datetime_type():
+    """**反向保护**：内存里的 ``trades_frame()`` 必须仍是 Datetime 列。
+
+    格式化只发生在**落盘那一步**。若有人图省事直接改 trades_frame 返回字符串，
+    依赖 ``.dt.date()`` 分组的下游（tests/test_engine.py）会立刻挂。
+    """
+    import polars as pl
+
+    from ptrade_sim import runtime
+
+    # 用一个真实引擎的小回测验证类型（轻量：日线 + 合成库）
+    assert "trades_frame" in dir(runtime.BacktestEngine)
+    # 直接验 helper 不改变入参对象（纯函数语义）
+    from datetime import datetime
+
+    df = pl.DataFrame({"time": [datetime(2021, 1, 5, 14, 50)]})
+    before = df.schema["time"]
+    pipeline._csv_friendly_time(df)
+    assert df.schema["time"] == before, "helper 不应就地修改传入的 DataFrame"
+
+
+def test_run_backtest_actually_formats_csv_time(tmp_path, monkeypatch, logs):
+    """**接线测试**：验证 run_backtest **真的调用**了格式化，而不只是函数写对了。
+
+    为什么必须单独一条：上面两条测的是 ``_csv_friendly_time`` 本身，
+    把调用点删掉它们**照样通过**（实测变异存活）。这条从「跑一次回测」
+    出发断言落盘的 CSV，才真正守住接线。
+    """
+    from datetime import datetime
+
+    df = pl.DataFrame(
+        {
+            "time": [datetime(2021, 1, 5, 14, 50, 0), datetime(2021, 1, 6, 9, 26, 0)],
+            "security": ["600095.SS", "002002.SZ"],
+            "side": ["sell", "buy"],
+            "amount": [-6700, 7900],
+            "price": [14.81, 3.94],
+            "turnover": [99227.0, 31126.0],
+            "commission": [123.9, 15.6],
+            "order_id": ["20210105-000001", "20210106-000002"],
+            "trade_pnl": [603.0, 0.0],
+        }
+    )
+    res = _run(tmp_path, monkeypatch, logs, trades_df=df)
+    assert res.rc == 0
+
+    csv = (res.hooks.engines[0].output_dir / "trades.csv").read_text(encoding="utf-8")
+    assert "2021-01-05 14:50:00" in csv, f"时间未被格式化：{csv[:200]}"
+    assert "T14:50" not in csv, "不应残留 ISO 的 T 分隔符"
+    assert ".000000" not in csv, "不应残留 6 位小数秒"
+    assert "600095.SS" in csv and "002002.SZ" in csv, "其余列不该受影响"

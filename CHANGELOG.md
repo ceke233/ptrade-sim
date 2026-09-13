@@ -73,6 +73,25 @@ cache 92% / config 98% 的余量足以盖住 dbtools 58%。
 
 ### 变更
 
+#### 🟠 `trades.csv` 的时间列格式不友好
+
+`trades_frame()` 返回的是 polars `Datetime` 列，而 `write_csv` 会把它
+序列化成 `2021-01-05T14:50:00.000000` —— 中间带 `T`、末尾 **6 位小数秒**：
+
+- **Excel 不认**这个格式（打开后当成文本，无法排序/画图）；
+- 看板也要额外解析（此前交易明细表就是因此直接把原始串显示出来）。
+
+**修法**：落盘前把 `time` 列格式化为 `YYYY-MM-DD HH:MM:SS`。
+
+**只在写出那一步格式化**，内存里的 `trades_frame()` 仍是 `Datetime` ——
+`tests/test_engine.py` 用 `.dt.date()` 按日分组，改成字符串会立刻挂。
+另加一条**接线测试**验证 `run_backtest` 真的调用了格式化：
+只测 `_csv_friendly_time()` 本身是不够的，把调用点删掉那两条测试**照样通过**
+（实测变异存活），必须从「跑一次回测」出发断言落盘的 CSV。
+
+`daily_stats.csv` 的 `date` 列本来就是 `YYYY-MM-DD`，未受影响。
+
+
 #### ⚠️ BREAKING CHANGE：CLI 退出码不再统一为 1
 
 | 码 | 含义 |

@@ -159,7 +159,9 @@ def run_backtest(args) -> int:
     # polars 写出（带 UTF-8 BOM，Excel 打开中文不乱码）
     (output_dir / "daily_stats.csv").write_text(frame_to_csv_text(daily), encoding="utf-8")
     trades = engine.trades_frame()
-    (output_dir / "trades.csv").write_text(frame_to_csv_text(trades), encoding="utf-8")
+    (output_dir / "trades.csv").write_text(
+        frame_to_csv_text(_csv_friendly_time(trades)), encoding="utf-8"
+    )
     summary = compute_metrics(daily, trades, engine.capital_base, cfg)
     # 展示名来自策略目录的 strategy_config.json（无 name 时为目录名），见 config.resolve_strategy
     summary.setdefault("config", {})["strategy_name"] = cfg.get("strategy_name") or ""
@@ -240,6 +242,28 @@ def run_backtest(args) -> int:
         return EXIT_DATA
 
     return 0
+
+
+def _csv_friendly_time(df):
+    """把成交表的 ``time`` 列格式化成 ``YYYY-MM-DD HH:MM:SS`` 后再写 CSV。
+
+    **为什么需要**：``trades_frame()`` 返回的是 polars ``Datetime`` 列，而
+    ``write_csv`` 会把它序列化成 ``2021-01-05T14:50:00.000000`` ——
+    中间带 ``T``、末尾 6 位小数秒。这个值在 Excel 里不认，看板也要额外处理。
+
+    **为什么只在写出时改**：内存里保持 ``Datetime`` 类型，别处（如
+    ``test_engine.py`` 用 ``.dt.date()`` 分组、以及任何按时间排序的调用）
+    都依赖它。格式化成字符串只发生在落盘这一步。
+
+    只认 ``Datetime`` 列；其它类型（或本就没有 trades）原样返回。
+    """
+    import polars as pl
+
+    if df is None or df.height == 0 or "time" not in df.columns:
+        return df
+    if df.schema["time"] not in (pl.Datetime, pl.Date):
+        return df
+    return df.with_columns(pl.col("time").dt.strftime("%Y-%m-%d %H:%M:%S"))
 
 
 def _resolve(cli, cfg) -> dict:

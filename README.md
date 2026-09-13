@@ -245,7 +245,7 @@ ptrade-sim dashboard --port 8765 --root backtest_results
 |---|---|
 | `summary.json` | 全部指标与配置留档（看板读它，字段见下） |
 | `daily_stats.csv` | 每日净值/现金/持仓市值/基准/回撤（**回测中逐日落盘**，看板实时读） |
-| `trades.csv` | 每笔成交：时间/代码/方向/数量/价格/佣金/盈亏 |
+| `trades.csv` | 每笔成交：时间/代码/方向/数量/价格/佣金/盈亏（时间列为 `YYYY-MM-DD HH:MM:SS`）|
 | `run_config.json` | 本次实际生效的配置（分层合并后的结果） |
 | `strategy_config.json` | 策略目录里那份的副本（展示名等留档，看历史无需外部配置） |
 | `strategy_source.py` | 策略源码副本（策略文件日后被删/改名也能回看） |
