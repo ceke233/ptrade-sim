@@ -87,7 +87,7 @@ def test_queue_dir_for_override_wins(qdir):
 
 
 def test_queue_dir_for_ignores_results_dir():
-    assert queue_dir_for("G:/somewhere/else") == default_queue_dir()
+    assert queue_dir_for("/somewhere/else") == default_queue_dir()
 
 
 # ============================================================

@@ -55,7 +55,7 @@ class CacheConfig:
     #:
     #: **必须设**：DuckDB 默认上限是系统内存的 80%，且缓冲池**只增不减** ——
     #: 本平台每天读不同日期的分区数据、几乎没有页复用，实测约 18 MB/天累积
-    #: （6 年区间 26 GB+，远超引擎预估的 7 GB）。2GB 实测可让占用平稳。
+    #: 长区间回测会累积到数十 GB）。2GB 实测可让占用平稳。
     duckdb_memory_limit: str | int | None = "2GB"
 
     @classmethod

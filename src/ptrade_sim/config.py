@@ -17,7 +17,7 @@
 
 一个策略一个目录，配置与代码放在一起::
 
-    strategies/yijin2/
+    strategies/my_strategy/
     ├── strategy_config.json    # 可选：该策略的配置（回测区间、资金、展示名、策略入参）
     └── strategy.py             # 必需：策略代码
 
@@ -229,7 +229,7 @@ class StrategyBundle(NamedTuple):
     #:
     #: 必须是显式字段而不是从 ``dir`` 推导 —— 早期实现写作
     #: ``dir.name or py.stem``，而单文件形态的 ``dir`` 是**父目录**，
-    #: 于是 ``examples/yijin2_5x892.py`` 的结果目录叫 ``examples-<时间戳>``：
+    #: 于是 ``examples/demo_momentum.py`` 的结果目录叫 ``examples-<时间戳>``：
     #: 名不副实，且同目录下多个单文件策略还会撞名无法区分。
     stem: str
 

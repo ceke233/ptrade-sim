@@ -2,7 +2,7 @@
 
 **为什么单列**：结果目录名是用户直接看到的东西（看板里、文件系统里）。
 早期实现写作 ``dir.name or py.stem``，而**单文件形态**的 ``dir`` 是父目录 ——
-于是 ``examples/yijin2_5x892.py`` 跑出来的结果目录叫 ``examples-<时间戳>``：
+于是 ``examples/demo_momentum.py`` 跑出来的结果目录叫 ``examples-<时间戳>``：
 名不副实，且同目录下多个单文件策略的结果目录**互无法区分**（只差时间戳）。
 
 本文件锁住两种形态的命名，防止再次回退到「从 dir 推导」。
@@ -23,16 +23,16 @@ def test_single_file_stem_is_file_name_not_parent_dir(tmp_path):
     """单文件策略的结果目录前缀应为**文件名**，而不是它所在的目录名。"""
     folder = tmp_path / "strategies"
     folder.mkdir()
-    sp = folder / "yijin2_5x892.py"
+    sp = folder / "demo_momentum.py"
     sp.write_text("def initialize(context):\n    pass\n", encoding="utf-8")
 
     b = resolve_strategy(sp)
-    assert b.stem == "yijin2_5x892", (
+    assert b.stem == "demo_momentum", (
         f"结果目录前缀应为文件名，实际 {b.stem!r} —— "
         f"若为 {folder.name!r} 说明又退回了「取父目录名」"
     )
     assert b.dir == folder, "dir 仍应是父目录（取数/相对路径要用）"
-    assert b.name == "yijin2_5x892"
+    assert b.name == "demo_momentum"
 
 
 def test_two_single_files_in_same_folder_get_distinct_stems(tmp_path):
@@ -71,15 +71,15 @@ def test_strategy_config_name_does_not_change_stem(tmp_path):
     """
     folder = tmp_path / "strategies"
     folder.mkdir()
-    sp = folder / "yijin2.py"
+    sp = folder / "alpha_signal.py"
     sp.write_text("def initialize(context):\n    pass\n", encoding="utf-8")
     (folder / "strategy_config.json").write_text(
-        json.dumps({"name": "一进二 · 创业板"}, ensure_ascii=False), encoding="utf-8"
+        json.dumps({"name": "示例 · 创业板"}, ensure_ascii=False), encoding="utf-8"
     )
 
     b = resolve_strategy(sp)
-    assert b.name == "一进二 · 创业板", "展示名应取配置里的 name"
-    assert b.stem == "yijin2", f"结果目录前缀仍应是文件名，实际 {b.stem!r}"
+    assert b.name == "示例 · 创业板", "展示名应取配置里的 name"
+    assert b.stem == "alpha_signal", f"结果目录前缀仍应是文件名，实际 {b.stem!r}"
 
 
 def test_stem_is_a_plain_string_attribute(tmp_path):

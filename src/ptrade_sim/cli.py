@@ -9,7 +9,7 @@
     ptrade-sim dashboard [--port 8765] [--root ./backtest_results] [--host 127.0.0.1]
     ptrade-sim queue     [--output-dir DIR] [--json]      # 查看运行/排队状态
     ptrade-sim db build  --db data/quant.duckdb --start-year 2019 --end-year 2025
-    ptrade-sim db verify --db data/quant.duckdb --data-dir G:/data
+    ptrade-sim db verify --db data/quant.duckdb --data-dir data/
                          [--start-year 2019] [--end-year 2025] [--dates D1,D2] [--json]
     ptrade-sim env       [--json]                         # 打印配置与资源视图
     ptrade-sim --version                                  # 打印版本号
@@ -111,7 +111,7 @@ def parse_args(argv=None):
     dsub = d.add_subparsers(dest="db_command")
     b = dsub.add_parser("build", help="从 parquet 构建 DuckDB 库")
     b.add_argument("--db", default="data/quant.duckdb")
-    b.add_argument("--data-dir", default="G:/data")
+    b.add_argument("--data-dir", default="data")
     b.add_argument("--start-year", type=int, default=DEFAULT_START_YEAR)
     b.add_argument("--end-year", type=int, default=DEFAULT_END_YEAR)
     b.add_argument("--tables", default=None, help="只建指定表（逗号分隔）")
@@ -121,7 +121,7 @@ def parse_args(argv=None):
     b.add_argument("--tmp", default=None, help="溢写目录")
     v = dsub.add_parser("verify", help="契约校验 + 与 parquet 等价性校验")
     v.add_argument("--db", default="data/quant.duckdb")
-    v.add_argument("--data-dir", default="G:/data")
+    v.add_argument("--data-dir", default="data")
     v.add_argument(
         "--start-year",
         type=int,
@@ -170,7 +170,7 @@ def _usage() -> int:
         "  ptrade-sim backtest --strategy examples/demo_rotation --start 2025-01-01\n"
         "  ptrade-sim backtest --db-path data/quant.duckdb\n"
         "  ptrade-sim queue\n"
-        "  ptrade-sim db verify --db data/quant.duckdb --data-dir G:/data --end-year 2026\n"
+        "  ptrade-sim db verify --db data/quant.duckdb --data-dir data/ --end-year 2026\n"
         "  ptrade-sim env --json\n"
         "  ptrade-sim --version\n\n"
         "配置分层（低→高）：config.example.json ← ptrade_config.json ← strategy_config.json ← PT_SIM_* ← CLI"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from ptrade_sim import resources as R
@@ -43,7 +45,7 @@ def test_probe_snapshot_fields():
 
 
 def test_probe_disk_optional():
-    s = R.probe("G:/")
+    s = R.probe(Path.cwd().anchor)  # 当前盘符（与平台无关）
     assert s.disk_free >= 0  # 路径不存在时也不应抛异常
 
 

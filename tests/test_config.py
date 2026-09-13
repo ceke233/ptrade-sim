@@ -87,7 +87,7 @@ def test_coerce_float_key():
 
 
 def test_coerce_string_key_stays_string():
-    assert C._coerce("db_path", "G:/quant.duckdb") == "G:/quant.duckdb"
+    assert C._coerce("db_path", "data/quant.duckdb") == "data/quant.duckdb"
 
 
 def test_coerce_bad_number_warns_and_returns_raw():
@@ -186,7 +186,7 @@ def test_local_config_discovery_order(tmp_path, monkeypatch):
 
 def _valid() -> dict:
     return {
-        "db_path": "G:/quant.duckdb",
+        "db_path": "data/quant.duckdb",
         "start_date": "2025-01-01",
         "end_date": "2025-12-31",
         "strategy": "s.py",

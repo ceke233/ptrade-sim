@@ -12,7 +12,7 @@
 - 看板在**开跑前**拉起、且起不来时必须降级为警告而不是阻断回测；
 - 产出契约：CSV 的 BOM、summary.json 的展示名 / 资源画像 / 数据缺口留档。
 
-**如何做到不依赖真实行情库**（``G:/quant.duckdb`` 不存在也不该被读到）：
+**如何做到不依赖真实行情库**（``data/quant.duckdb`` 不存在也不该被读到）：
 
 1. 用 ``monkeypatch`` 把 ``pipeline.BacktestEngine`` 换成假引擎（记录编排层交给它的参数，
    返回固定的 polars 表），真引擎一次都不会被构造；
@@ -677,7 +677,7 @@ def test_data_errors_make_the_run_fail_loudly(tmp_path, monkeypatch, logs):
 
     防的是实测踩到过的坑：一次 6 年分钟回测里有 7 次 DuckDB 查询失败
     （Out of Memory），被 ``_q`` 吞成「该日无数据」——
-    同一策略同一区间的结果从 12620.69% 变成 5706.29%、成交从 1021 笔变成 802 笔。
+    同一策略、同一区间的收益与成交笔数就出现了量级级别的差异。
     一行 WARNING 埋在 28000 行日志里，run 目录照常产出 summary.json，
     用户拿到的是一份**看起来很正常的错误结果**。
     """

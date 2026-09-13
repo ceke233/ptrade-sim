@@ -86,7 +86,7 @@ def test_parse_db_build():
             "--db",
             "x.duckdb",
             "--data-dir",
-            "G:/data",
+            "data/",
             "--start-year",
             "2020",
             "--end-year",
@@ -214,7 +214,7 @@ def test_backtest_missing_strategy_returns_error(tmp_path, monkeypatch, capsys):
     p.write_text(
         json.dumps(
             {
-                "db_path": "G:/quant.duckdb",
+                "db_path": "data/quant.duckdb",
                 "start_date": "2025-01-01",
                 "end_date": "2025-01-31",
                 "strategy": "no_such_strategy.py",
@@ -299,7 +299,7 @@ def test_backtest_missing_strategy_path_reports_it(tmp_path, monkeypatch, capsys
                 "strategy": str(tmp_path / "nope"),
                 "start_date": "2025-01-01",
                 "end_date": "2025-01-31",
-                "db_path": "G:/quant.duckdb",
+                "db_path": "data/quant.duckdb",
             }
         ),
         encoding="utf-8",

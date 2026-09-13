@@ -42,7 +42,7 @@
     "preload.mode": "rolling=流式（默认，按内存预算滚动，长区间内存平稳）| all=全量常驻（长区间易 OOM）",
     "cache.minute_memory_budget": "\"auto\"（可用内存×ratio）|\"512MB\"|\"2GB\"|字节数|null=不限",
     "cache.daily_capacity": "日线/估值缓存条数上限；null=不淘汰",
-    "cache.duckdb_memory_limit": "DuckDB 缓冲池上限，\"2GB\"|\"512MB\"|字节数。**不建议设为 null**：DuckDB 默认取系统内存的 80% 且缓冲池只增不减，而本平台每天读不同日期、几乎没有页复用，不设上限会让长区间回测累计数十 GB（实测 6 年区间 26 GB+，设 2GB 后平稳在 1.9 GB）",
+    "cache.duckdb_memory_limit": "DuckDB 缓冲池上限，\"2GB\"|\"512MB\"|字节数。**不建议设为 null**：DuckDB 默认取系统内存的 80% 且缓冲池只增不减，而本平台每天读不同日期、几乎没有页复用，不设上限会让长区间回测累计数十 GB（设 2GB 后平稳在 1.9 GB）",
     "queue.max_parallel": "最多同时跑几个回测；null=按 cpu_count//2",
     "queue.cpu_slots_limit": "所有回测线程数之和上限；null=按 cpu_count-1",
     "queue.dir": "队列注册表目录；null=机器级默认 ~/.ptrade-sim/queue（跨 output-dir 协调）",
